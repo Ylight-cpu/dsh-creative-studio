@@ -28,9 +28,9 @@ node "$pkg\scripts\run-toolkit.mjs" doctor --json     # tiers, ffmpeg, fonts, mo
 
 Call the toolkit as `node "$pkg\scripts\run-toolkit.mjs" <command> …` (or directly `"$pkg\runtime\Scripts\python.exe" "$pkg\toolkit\cs.py" …`). Always pass `--json`.
 
-**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` — 18 checks on self-generated fixtures. Non-zero exit means a capability is broken here: report it, do not deliver.
+**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` — 26 checks on self-generated fixtures. Non-zero exit means a capability is broken here: report it, do not deliver.
 
-**Tiers.** T0 Pillow (text, logo, compose, export, sheet, palette, inspect) · T1 rembg+ONNX (matting, inpaint) · T2 ffmpeg (video). If `doctor` reports a missing tier, say so instead of faking the result.
+**Tiers.** T0 Pillow (text, logo, compose, export, sheet, palette, inspect) · T1 rembg+ONNX (matting, inpaint) · T2 ffmpeg (video cut/join/subtitles/export) · T3 onnxruntime (video matting, animated titles, transitions, light effects — see the `video-studio` skill). If `doctor` reports a missing tier, say so instead of faking the result.
 
 ## The four jobs you will actually be asked to do
 
@@ -41,6 +41,8 @@ Call the toolkit as `node "$pkg\scripts\run-toolkit.mjs" <command> …` (or dire
 
 Full command list, every option and the retouch decision tree: **`reference/commands.md`**.
 Layout, typography and matting-quality rules: **`reference/quality.md`**.
+
+Video work — AI matting with background replacement, animated titles, transitions and light effects — lives in the companion skill **`video-studio`** (same package, same toolkit: `video-matte`, `video-text-anim`, `video-join --transition`, `video-fx`). When a task mixes stills and motion, do the stills here and the motion there.
 
 ## Matting quality policy (do not default to the fastest model)
 
