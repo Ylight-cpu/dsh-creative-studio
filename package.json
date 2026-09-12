@@ -1,0 +1,71 @@
+{
+  "name": "dsh-creative-studio",
+  "version": "0.1.0",
+  "description": "DSH × Creative Studio — a portable AI image-retouching and video-editing skill pack for DeepSeek Harness: background removal with quality tiers, inpainting retouch, text/logo compositing, batch platform exports, footage review, storyboards and timeline editing. · 美工 + 视频剪辑技能包：抠图/改图/文字/logo/合成/批量规格化 + 素材通览/脚本/剪辑/字幕/配乐/封面。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "skills",
+    "toolkit",
+    "scripts",
+    "docs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "skill",
+    "skills",
+    "image",
+    "matting",
+    "background-removal",
+    "inpainting",
+    "compositing",
+    "video-editing",
+    "ffmpeg",
+    "rembg"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.1.1-rc.2 <0.1.2 || >=0.1.2-rc.1 <0.2.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "doctor": "node scripts/run-toolkit.mjs doctor",
+    "selftest": "node scripts/run-toolkit.mjs selftest",
+    "verify": "node scripts/provider-selftest.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-skill": ">=0.1.1-rc.2 <0.1.2 || >=0.1.2-rc.1 <0.2.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-skill": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ylight-cpu/dsh-creative-studio.git"
+  },
+  "homepage": "https://github.com/Ylight-cpu/dsh-creative-studio",
+  "bugs": {
+    "url": "https://github.com/Ylight-cpu/dsh-creative-studio/issues"
+  },
+  "author": "Ylight-cpu"
+}

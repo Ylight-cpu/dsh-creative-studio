@@ -1,0 +1,6 @@
+# dsh-creative-studio — DSH profile bundle patch.
+# Registers the plugin (and therefore its bundled image-studio / video-studio skills)
+# with the host. Loaded from the profile's dsh.profile.bundles list.
+- insert:
+    - id: creative-studio
+      name: 'dsh-creative-studio'

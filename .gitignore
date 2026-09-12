@@ -1,0 +1,28 @@
+# Local runtime: machine-specific Python venv + models + bundled ffmpeg.
+# Rebuilt on any machine by scripts/bootstrap.ps1 — never commit it.
+runtime/
+tools/uv/
+
+# Build output
+dist/
+*.tgz
+
+# Test fixtures and acceptance output
+tests/out/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Scratch and backups
+*.bak
+*.bak-*
+*.before-official-*
+*.log

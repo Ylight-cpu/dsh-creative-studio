@@ -1,0 +1,21 @@
+# Dev-only paths that must never ship in the published tarball.
+# `files` in package.json is a whitelist for top-level entries; this file prunes
+# the build junk that lives inside those included directories.
+
+# Python bytecode / caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local runtime (machine-specific: venv + models + ffmpeg binary), rebuilt by scripts/bootstrap.ps1
+runtime/
+tools/uv/
+
+# Local test fixtures and acceptance output
+tests/
+
+# Backups and scratch
+*.bak
+*.bak-*
+*.before-official-*
+*.tgz
