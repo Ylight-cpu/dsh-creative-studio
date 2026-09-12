@@ -297,7 +297,7 @@ def cmd_matte(args) -> int:
     inputs = list(args.inputs)
 
     def resolve_model(src_path: str) -> str:
-        """质量策略：fast=u2net(最快) / auto=小图用 birefnet、大图用 isnet / best=birefnet。
+        """质量策略：fast=u2net(最快) / auto=小图用 birefnet、大图先 isnet（质量不达标会自动升级）/ best=birefnet。
         依据：生产实测 BiRefNet 毛发 94%、玻璃 78%，U2Net 仅 71%/48%。"""
         if args.model and args.model != "auto":
             return args.model
@@ -313,22 +313,44 @@ def cmd_matte(args) -> int:
             mp = 99.0
         return "birefnet-general" if mp <= 2.0 else "isnet-general-use"
 
+    def get_session(name: str):
+        if name not in session_cache:
+            session_cache[name] = new_session(name)
+        return session_cache[name]
+
     session_cache: dict[str, object] = {}
     outs, reports = [], []
     for src in inputs:
         model = resolve_model(src)
-        if model not in session_cache:
-            try:
-                session_cache[model] = new_session(model)
-            except Exception as e:
-                print(f"MODEL_ERROR[{model}]: {e}", file=sys.stderr)
-                return 4
+        try:
+            get_session(model)
+        except Exception as e:
+            print(f"MODEL_ERROR[{model}]: {e}", file=sys.stderr)
+            return 4
         t0 = time.time()
         img = Image.open(src)
-        cut = remove(img, session=session_cache[model], alpha_matting=args.alpha_matting,
-                     **({"alpha_matting_foreground_threshold": args.fg_threshold,
-                         "alpha_matting_background_threshold": args.bg_threshold,
-                         "alpha_matting_erode_size": args.erode} if args.alpha_matting else {}))
+
+        def run_matte(mdl: str):
+            return remove(img, session=get_session(mdl), alpha_matting=args.alpha_matting,
+                          **({"alpha_matting_foreground_threshold": args.fg_threshold,
+                              "alpha_matting_background_threshold": args.bg_threshold,
+                              "alpha_matting_erode_size": args.erode} if args.alpha_matting else {}))
+
+        cut = run_matte(model)
+        qa = alpha_quality(cut)
+        escalated = None
+        # auto 策略：只看像素数不够——实测 2048×2048 用 isnet 边缘过渡 9.75px（糊边），
+        # 而 birefnet 只要 6 秒且降到 2.99px。因此按【边缘质量实测结果】自动升级。
+        if (args.quality == "auto" and model != "birefnet-general"
+                and qa.get("transition_px", 0) > 4.0):
+            try:
+                cut2 = run_matte("birefnet-general")
+                qa2 = alpha_quality(cut2)
+                if qa2.get("transition_px", 99) < qa.get("transition_px", 99):
+                    escalated = f"{model}({qa.get('transition_px')}px) -> birefnet-general({qa2.get('transition_px')}px)"
+                    cut, qa, model = cut2, qa2, "birefnet-general"
+            except Exception as e:
+                print(f"ESCALATE_SKIPPED: {e}", file=sys.stderr)
         elapsed = time.time() - t0
         if args.feather:
             a = cut.getchannel("A").filter(ImageFilter.GaussianBlur(args.feather))
@@ -339,14 +361,15 @@ def cmd_matte(args) -> int:
         out = Path(args.out) if (args.out and len(inputs) == 1) else \
             default_out(src, "-matte", ".png")
         save_image(cut, out)
-        qa = alpha_quality(cut)
+        # qa 取自合成前的 alpha 结果（加了 --bg 之后 alpha 已被吃掉，无法再量边缘）
         warning = None
         if qa.get("transition_px", 0) and qa["transition_px"] > 3.0:
             warning = (f"边缘过渡宽度 {qa['transition_px']}px 偏大（可能糊边/光晕）；"
                        "可试 --quality best 或 --alpha-matting")
         outs.append(str(out))
         reports.append({"input": str(src), "output": str(out), "model": model,
-                        "seconds": round(elapsed, 2), "qa": qa, "warning": warning})
+                        "seconds": round(elapsed, 2), "qa": qa, "escalated": escalated,
+                        "warning": warning})
     emit({"model_policy": args.quality, "results": reports, "outputs": outs}, args.json)
     return 0
 
@@ -627,6 +650,31 @@ PRESETS = {
 }
 
 
+def subject_bbox(img: Image.Image, bg_tolerance: int = 14) -> tuple[int, int, int, int] | None:
+    """求主体外接框：有 alpha 用 alpha；否则以边框主色为背景做差。
+
+    用途：产品图常在整机居中时留下大片空白（实测某 2048² 图商品只占 31% 画幅），
+    平台主图（如亚马逊）要求商品占画幅 ≥85%，必须先按主体紧裁再规格化。
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    if img.mode == "RGBA" and img.getchannel("A").getextrema()[0] < 255:
+        return img.getchannel("A").getbbox()
+    arr = np.asarray(img.convert("RGB"), dtype=np.int16)
+    h, w, _ = arr.shape
+    border = np.concatenate([arr[0:2].reshape(-1, 3), arr[h - 2:h].reshape(-1, 3),
+                             arr[:, 0:2].reshape(-1, 3), arr[:, w - 2:w].reshape(-1, 3)])
+    bgc = np.median(border, axis=0)
+    diff = np.abs(arr - bgc).max(axis=2)
+    mask = diff > bg_tolerance
+    ys, xs = np.where(mask)
+    if not len(xs):
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
 def cmd_export(args) -> int:
     if args.preset and args.preset in PRESETS:
         (tw, th), mode, bg = PRESETS[args.preset]
@@ -647,9 +695,21 @@ def cmd_export(args) -> int:
         srcs += sorted([q for q in p.iterdir() if q.suffix.lower() in
                         (".png", ".jpg", ".jpeg", ".webp")]) if p.is_dir() else [p]
 
-    outs = []
+    outs, tightings = [], []
     for src in srcs:
         img = open_rgba(src)
+        if args.tight:
+            box = subject_bbox(img if not bg else img, args.tight_tolerance)
+            if box:
+                w, h = img.size
+                mx = int(min(w, h) * args.tight)
+                x0, y0, x1, y1 = box
+                x0, y0 = max(0, x0 - mx), max(0, y0 - mx)
+                x1, y1 = min(w, x1 + mx), min(h, y1 + mx)
+                before = (x1 - x0) * (y1 - y0) / (w * h)
+                img = img.crop((x0, y0, x1, y1))
+                tightings.append({"file": str(src), "crop": [x0, y0, x1, y1],
+                                  "was_fill": round(before, 3), "margin_ratio": args.tight})
         if mode == "fit":
             r = min(tw / img.size[0], th / img.size[1])
             new = img.resize((max(1, int(img.size[0] * r)), max(1, int(img.size[1] * r))), Image.LANCZOS)
@@ -667,9 +727,13 @@ def cmd_export(args) -> int:
             canvas = Image.new("RGBA", (tw, th), parse_color(bg) if bg else (0, 0, 0, 0))
             canvas.alpha_composite(new, ((tw - new.size[0]) // 2, (th - new.size[1]) // 2))
         out_dir = Path(args.out_dir) if args.out_dir else src.parent
-        out = save_image(canvas, out_dir / f"{src.stem}-{args.preset or f'{tw}x{th}'}.png")
+        suffix = f"-tight{args.tight}" if args.tight else ""
+        out = save_image(canvas, out_dir / f"{src.stem}-{args.preset or f'{tw}x{th}'}{suffix}.png")
         outs.append(str(out))
-    emit({"mode": mode, "size": [tw, th], "background": bg, "count": len(outs), "outputs": outs}, args.json)
+    payload = {"mode": mode, "size": [tw, th], "background": bg, "count": len(outs), "outputs": outs}
+    if tightings:
+        payload["tight"] = tightings
+    emit(payload, args.json)
     return 0
 
 
@@ -1925,6 +1989,28 @@ def cmd_selftest(args) -> int:
     code, _, err = call(["sheet", str(fx1), str(fx2), "--out", str(t5), "--labels"])
     check("T0 sheet (接触表)", code == 0 and t5.exists(), err)
 
+    # 紧裁：大留白图 → 主体占画幅应显著提升（平台主图要求商品占画幅 ≥85%）
+    sp = work / "sparse.png"
+    sparse = Image.new("RGB", (800, 800), (255, 255, 255))
+    ImageDraw.Draw(sparse).rectangle((300, 340, 500, 460), fill=(31, 110, 67))
+    sparse.save(sp)
+    tdir = work / "tight"
+    code, _, err = call(["export", str(sp), "--preset", "square", "--tight", "0.05", "--out-dir", str(tdir)])
+    tight_file = next(iter(sorted(tdir.glob("*.png"))), None) if tdir.exists() else None
+    fill_before = (200 * 120) / (800 * 800)
+    fill_after = 0.0
+    if tight_file:
+        try:
+            import numpy as np
+            a = np.asarray(Image.open(tight_file).convert("RGB"), dtype=np.int16)
+            nz = (a < 245).any(axis=2)
+            ys, xs = np.where(nz)
+            fill_after = ((xs.max() - xs.min()) * (ys.max() - ys.min())) / (a.shape[0] * a.shape[1])
+        except Exception:
+            fill_after = 0.0
+    check("T0 export --tight (主体紧裁)", code == 0 and fill_after > fill_before * 3,
+          f"主体占画幅 {fill_before:.3f} → {fill_after:.3f}")
+
     code, out, err = call(["palette", str(fx1), "--colors", "4"])
     check("T0 palette", code == 0 and "#" in out, err)
 
@@ -2153,6 +2239,10 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--preset", choices=sorted(PRESETS))
     e.add_argument("--size", help="自定义 WxH")
     e.add_argument("--mode", choices=["pad", "fit", "crop"])
+    e.add_argument("--tight", type=float, nargs="?", const=0.06, default=0.0,
+                   help="按主体自动紧裁后再规格化（可带边距比例，默认 0.06）；"
+                        "平台主图要求商品占画幅 ≥85%% 时用它")
+    e.add_argument("--tight-tolerance", type=int, default=14, help="判定主体的背景色差阈值")
     e.add_argument("--bg")
     e.add_argument("--out-dir")
     e.set_defaults(func=cmd_export)
