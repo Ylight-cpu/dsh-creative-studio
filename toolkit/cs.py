@@ -236,9 +236,18 @@ def cmd_doctor(args) -> int:
         report["gpu"] = None
     tier = "T0 (Pillow)"
     if deps.get("rembg") and deps.get("onnxruntime"):
-        tier = "T1 (matting/onnx)" if report["model_cache_files"] else "T1 (matting ready, model not downloaded yet)"
+        tier = "T1 (image matting/onnx)" if report["model_cache_files"] else "T1 (image matting ready, model not downloaded yet)"
     if ff:
-        tier += " + video via ffmpeg"
+        tier += " + T2 (video editing: cut/join/subtitles/export)"
+    # T3：视频抠像（RVM）与特效，依赖 onnxruntime；模型按需下载
+    rvm = MODEL_DIR / RVM_MODELS["mobilenetv3"]["file"]
+    report["rvm_model"] = {"path": str(rvm), "present": rvm.exists(),
+                           "size_mb": round(rvm.stat().st_size / 1e6, 1) if rvm.exists() else None}
+    if deps.get("onnxruntime"):
+        tier += " + T3 (video matting/effects" + (", RVM model cached" if rvm.exists() else ", RVM downloads on first use") + ")"
+    if ff:
+        n_x = len(list_xfade_transitions(ff)) if "list_xfade_transitions" in globals() else 0
+        report["xfade_transitions"] = n_x
     report["tier"] = tier.strip()
     emit(report, args.json)
     return 0
