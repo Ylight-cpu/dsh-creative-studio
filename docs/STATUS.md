@@ -1,4 +1,19 @@
-# dsh-creative-studio — 建设状态（2026-09-11）
+# dsh-creative-studio — 建设状态（2026-09-11；发布记录更新至 2026-09-12）
+
+## 发布状态（2026-09-12）
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| 公开仓库 | ✅ | https://github.com/Ylight-cpu/dsh-creative-studio （public，main） |
+| Release v0.1.0 + tarball | ✅ | 资产 `dsh-creative-studio.tgz`，63,819 B，sha256 `9ac411f8…`（与本地打包一致） |
+| 条目引用的 tarball 地址 | ✅ | `.../releases/latest/download/dsh-creative-studio.tgz` 实测 HEAD 200 + 实下载 62.3 KB |
+| 仓库 topic | ✅ | `dsh-plugin`、`deepseek-harness`、`skill`、`image-editing`、`video-editing`、`ffmpeg` |
+| 从公开源安装（CI 检查项） | ✅ | 临时 profile 执行 `dsh plugin --profile citest add github:Ylight-cpu/dsh-creative-studio` 成功，bundles 被官方 CLI 自动纳入（临时 profile 已清理） |
+| peer 范围预发布陷阱 | ✅ | semver 实测：旧 `^0.1.1-rc.2` 不匹配 `0.1.2-rc.1`（本机宿主版本），已改为显式分支范围 |
+| 列表条目 PR | 🕐 待审 | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/4908 （1 文件 +23 行）<br>仓库创建当天提交，`check-submission.mjs` 的 `MIN_AGE_DAYS = 1` 会在首轮报"0.x days old"，该检查自述会自行重跑（仓库另有 `regate.yml` 重评刚满龄条目），故 PR 说明中已注明 |
+
+发布流程细节与两条硬门槛（`dsh.bundle`、仓库满 1 天）见 `docs/PUBLISH.md`。
+npm 发布为可选项（不影响收录）：发布后 `repository` 字段需指回本仓库，市场会自动关联下载量。
 
 ## 已完成并实测通过
 
