@@ -20,6 +20,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -876,11 +878,55 @@ def cmd_video_cut(args) -> int:
     return 0
 
 
+def list_xfade_transitions(ff: str) -> list[str]:
+    """从 ffmpeg 自身枚举可用的 xfade 转场名（不写死列表，随构建更新）。"""
+    out = subprocess.run([ff, "-hide_banner", "-h", "filter=xfade"],
+                         capture_output=True, text=True, errors="replace").stdout or ""
+    names: set[str] = set()
+    for line in out.splitlines():
+        if "transition" in line.lower() and ":" in line and "fade" in line:
+            continue
+        for tok in line.replace(",", " ").split():
+            t = tok.strip()
+            if 3 <= len(t) <= 22 and t.islower() and t.isalpha():
+                names.add(t)
+    # 只保留真的能用的：以常见转场词典过滤，避免把参数名当成转场名
+    known = {
+        "fade", "fadeblack", "fadewhite", "fadegrays", "distance", "wipeleft", "wiperight",
+        "wipeup", "wipedown", "slideleft", "slideright", "slideup", "slidedown", "smoothleft",
+        "smoothright", "smoothup", "smoothdown", "circleopen", "circleclose", "circlecrop",
+        "rectcrop", "vertopen", "vertclose", "horzopen", "horzclose", "dissolve", "pixelize",
+        "radial", "hlslice", "hrslice", "vuslice", "vdslice", "hblur", "diagtl", "diagtr",
+        "diagbl", "diagbr", "hlwind", "hrwind", "vuwind", "vdwind", "coverleft", "coverright",
+        "coverup", "coverdown", "revealleft", "revealright", "revealup", "revealdown",
+        "squeezev", "squeezeh", "zoomin", "lunax", "custom",
+    }
+    found = sorted((names & known) | {"fade"})
+    return found
+
+
+# 风格化转场：pre = 作用在"后一段"开头的效果（trim+效果+concat 实现，不依赖时间轴支持）
+STYLIZED_TRANSITIONS = {
+    "flash":      {"base": "fadewhite", "pre": None, "note": "白闪转场（原生 fadewhite）"},
+    "glitch":     {"base": "pixelize", "pre": "rgbashift=rh=-14:bh=14,noise=alls=26:allf=t", "note": "故障风：色彩偏移+噪点后像素化切入"},
+    "whip-pan":   {"base": "smoothleft", "pre": "tmix=frames=7:weights='1 1 1 2 2 3 3',boxblur=luma_radius=8:luma_power=1", "note": "鞭甩：方向性拖影后平滑左滑"},
+    "soft-zoom":  {"base": "fade", "pre": "gblur=sigma=16", "note": "柔焦推入：高斯模糊后淡入（近似变焦）"},
+    "film-burn":  {"base": "fadeblack", "pre": "colorbalance=rs=0.35:gs=-0.05:bs=-0.25,noise=alls=18:allf=t", "note": "胶片灼烧：暖色偏移+颗粒后黑场切入"},
+}
+
+
 def cmd_video_join(args) -> int:
     ff = find_ffmpeg()
     if not ff:
         warn_tier("video", "pip install imageio-ffmpeg")
         return 3
+
+    if getattr(args, "list_transitions", False):
+        names = list_xfade_transitions(ff)
+        emit({"count": len(names), "xfade": names,
+              "stylized": {k: v["note"] for k, v in STYLIZED_TRANSITIONS.items()}}, args.json)
+        return 0
+
     srcs = [str(Path(p)) for p in args.inputs]
     if len(srcs) < 2:
         print("JOIN_ERROR: 至少两个输入", file=sys.stderr)
@@ -900,9 +946,23 @@ def cmd_video_join(args) -> int:
         H = int(v0.get("height") or 1920)
 
         filters: list[str] = []
+        stylized = STYLIZED_TRANSITIONS.get(args.transition)
+        transition_name = stylized["base"] if stylized else args.transition
+        pre_node: dict[int, str] = {}
+        if stylized and stylized.get("pre"):
+            # 把效果只加在"后一段"的开头：trim(0,d) 加效果 + trim(d) 原样，再 concat
+            win = max(0.2, min(0.5, args.transition_duration))
+            for i in range(1, len(srcs)):
+                filters.append(
+                    f"[{i}:v]trim=0:{win:.3f},setpts=PTS-STARTPTS,{stylized['pre']}[pe{i}];"
+                    f"[{i}:v]trim={win:.3f},setpts=PTS-STARTPTS[pn{i}];"
+                    f"[pe{i}][pn{i}]concat=n=2:v=1[pre{i}]")
+                pre_node[i] = f"[pre{i}]"
+
         for i in range(len(srcs)):
+            head = pre_node.get(i, f"[{i}:v]")
             filters.append(
-                f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={target_fps},"
+                f"{head}settb=AVTB,setpts=PTS-STARTPTS,fps={target_fps},"
                 f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
                 f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}]")
             if use_audio:
@@ -913,7 +973,7 @@ def cmd_video_join(args) -> int:
         cur_v, cur_a, offset = "[v0]", "[a0]", 0.0
         for i in range(1, len(srcs)):
             offset += durs[i - 1] - args.transition_duration
-            filters.append(f"{cur_v}[v{i}]xfade=transition={args.transition}:"
+            filters.append(f"{cur_v}[v{i}]xfade=transition={transition_name}:"
                            f"duration={args.transition_duration}:offset={max(0.0, offset):.3f}[x{i}]")
             if use_audio:
                 filters.append(f"{cur_a}[a{i}]acrossfade=d={args.transition_duration}[y{i}]")
@@ -1182,6 +1242,580 @@ def cmd_video_export(args) -> int:
 
 
 
+# ---------------------------- AI 视频抠像（RVM ONNX） ----------------------------
+
+MODEL_DIR = Path(os.environ.get("CS_MODEL_DIR") or (Path.home() / ".dsh-creative-studio" / "models"))
+
+RVM_MODELS = {
+    "mobilenetv3": {
+        "file": "rvm_mobilenetv3_fp32.onnx",
+        "url": "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx",
+        "min_bytes": 10 * 1024 * 1024,
+        "note": "RVM MobileNetV3 — 14 MB，CPU 可跑，视频抠像首选",
+    },
+    "resnet50": {
+        "file": "rvm_resnet50_fp32.onnx",
+        "url": "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.onnx",
+        "min_bytes": 60 * 1024 * 1024,
+        "note": "RVM ResNet50 — 102 MB，边缘更好但更慢",
+    },
+}
+
+
+def ensure_rvm_model(name: str) -> Path:
+    """确保 RVM ONNX 模型就位（首次自动下载）。"""
+    spec = RVM_MODELS.get(name)
+    if not spec:
+        raise SystemExit(f"未知模型 {name}；可选：{', '.join(RVM_MODELS)}")
+    dest = MODEL_DIR / spec["file"]
+    if dest.exists() and dest.stat().st_size >= spec["min_bytes"]:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[model] 下载 {spec['note']} ...", file=sys.stderr, flush=True)
+    tmp = dest.with_suffix(".part")
+    with urllib.request.urlopen(spec["url"], timeout=120) as r, open(tmp, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                pct = done * 100 // total
+                print(f"\r[model] {pct:3d}%  {done/1e6:.1f}/{total/1e6:.1f} MB", end="", file=sys.stderr, flush=True)
+    print("", file=sys.stderr, flush=True)
+    if tmp.stat().st_size < spec["min_bytes"]:
+        tmp.unlink(missing_ok=True)
+        raise SystemExit("模型下载不完整，请重试（或设 HTTPS_PROXY 走代理）")
+    tmp.replace(dest)
+    return dest
+
+
+def _fps_of(v: dict) -> float:
+    rate = v.get("r_frame_rate") or "30"
+    try:
+        if isinstance(rate, str) and "/" in rate:
+            num, den = rate.split("/")
+            return float(num) / float(den or 1)
+        return float(rate)
+    except Exception:
+        return 30.0
+
+
+def cmd_video_matte(args) -> int:
+    """视频抠像换背景：AI（RVM ONNX，任意背景）或色键（绿幕，纯 ffmpeg）。"""
+    ff = find_ffmpeg()
+    if not ff:
+        warn_tier("video", "pip install imageio-ffmpeg")
+        return 3
+
+    src = args.input
+    data = ffprobe_json(ff, src)
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    W, H = int(v.get("width") or 0), int(v.get("height") or 0)
+    if not W or not H:
+        print("MATTE_ERROR: 读不到视频尺寸", file=sys.stderr)
+        return 2
+    fps = _fps_of(v)
+    limit = parse_time(args.limit) if args.limit else None
+    out = Path(args.out or Path(src).with_name(Path(src).stem + "-matte.mp4"))
+
+    # ---------- 色键路径（纯 ffmpeg，最快，适合绿幕素材）----------
+    if args.backend == "chromakey" or args.key_color:
+        key = args.key_color or "0x00FF00"
+        chain = f"colorkey={key}:{args.key_similarity}:{args.key_blend}"
+        if args.despill:
+            chain += f",despill=type={args.despill}"
+        pre = ["-y"] + (["-t", f"{limit:.3f}"] if limit else [])
+        if args.bg_image:
+            cmd = ([ff, "-hide_banner", "-loglevel", "error"] + pre + ["-i", src, "-loop", "1", "-i", str(args.bg_image),
+                   "-filter_complex",
+                   f"[0:v]{chain}[fg];[1:v]scale={W}:{H},setsar=1[bg];[bg][fg]overlay=shortest=1[v]",
+                   "-map", "[v]", "-map", "0:a?", "-shortest",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+                   "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)])
+        else:
+            bg = args.bg_color or "white"
+            cmd = ([ff, "-hide_banner", "-loglevel", "error"] + pre + ["-i", src,
+                   "-filter_complex",
+                   f"[0:v]{chain}[fg];color=c={bg}:s={W}x{H}:r={fps:.3f}[bg];[bg][fg]overlay=shortest=1[v]",
+                   "-map", "[v]", "-map", "0:a?", "-shortest",
+                   "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+                   "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)])
+        code, err = run_ff(cmd)
+        result = {"output": str(out), "backend": "chromakey", "key": key, "size": f"{W}x{H}",
+                  "background": args.bg_color or (str(args.bg_image) if args.bg_image else "white"),
+                  "error": None if code == 0 else err[:400]}
+        if args.compare and code == 0:
+            result["compare"] = export_compare_frames(ff, src, out, Path(args.compare_dir or out.parent),
+                                                      Path(src).stem + "-matte", args.json)
+        emit(result, args.json)
+        return 0 if code == 0 else 2
+
+    # ---------- AI 路径（RVM，任意背景）----------
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except Exception:
+        warn_tier("video-matte", "python -m pip install onnxruntime numpy")
+        return 3
+
+    model_path = ensure_rvm_model(args.model)
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
+    if args.gpu and "CUDAExecutionProvider" not in providers:
+        print("提示：未检测到 CUDA provider，回退 CPU（装 onnxruntime-gpu 可加速）", file=sys.stderr)
+    sess = ort.InferenceSession(str(model_path), providers=providers)
+    in_names = [i.name for i in sess.get_inputs()]
+    out_names = [o.name for o in sess.get_outputs()]
+
+    bg_img = Image.open(args.bg_image).convert("RGB").resize((W, H), Image.LANCZOS) if args.bg_image else None
+    bg_rgb = np.array(parse_color(args.bg_color)[:3], dtype=np.float32) if args.bg_color else None
+    if args.mode == "composite" and bg_rgb is None and bg_img is None:
+        bg_rgb = np.array([255, 255, 255], dtype=np.float32)
+
+    dec_cmd = [ff, "-hide_banner", "-loglevel", "error", "-i", src]
+    if limit:
+        dec_cmd += ["-t", f"{limit:.3f}"]
+    dec_cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    dec = subprocess.Popen(dec_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    frame_out_dir = Path(args.frames_dir or (out.parent / f"{out.stem}-frames"))
+    enc = None
+    enc_err = b""
+    if args.mode == "composite":
+        enc_cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", f"{fps:.3f}", "-i", "-"]
+        if limit:
+            enc_cmd += ["-t", f"{limit:.3f}"]
+        enc_cmd += ["-i", src, "-map", "0:v", "-map", "1:a?", "-shortest",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+                    "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
+        enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        frame_out_dir.mkdir(parents=True, exist_ok=True)
+
+    rec = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
+    ratio = np.array([args.downsample_ratio], dtype=np.float32)
+    fcount, t0, prev_alpha = 0, time.time(), None
+    frame_size = W * H * 3
+    try:
+        while True:
+            buf = dec.stdout.read(frame_size)
+            if len(buf) < frame_size:
+                break
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
+            feeds = {}
+            for nm in in_names:
+                low = nm.lower()
+                if low == "src":
+                    feeds[nm] = frame.transpose(2, 0, 1)[None, :, :, :]
+                elif low == "downsample_ratio":
+                    feeds[nm] = ratio
+                elif low.startswith("r") and low.endswith("i"):
+                    idx = int(low[1]) - 1
+                    if 0 <= idx < 4:
+                        feeds[nm] = rec[idx]
+            outs = sess.run(None, feeds)
+            by_name = dict(zip(out_names, outs))
+            pha = by_name.get("pha", outs[min(1, len(outs) - 1)])[0, 0]
+            fgr = by_name.get("fgr", outs[0])[0].transpose(1, 2, 0)
+            for i in range(4):
+                if f"r{i+1}o" in by_name:
+                    rec[i] = by_name[f"r{i+1}o"]
+            if args.alpha_smooth and prev_alpha is not None:
+                a = args.alpha_smooth
+                pha = a * prev_alpha + (1 - a) * pha
+            prev_alpha = pha
+            pha3 = pha[:, :, None]
+
+            if args.mode == "composite":
+                bg = (np.asarray(bg_img, dtype=np.float32) / 255.0) if bg_img is not None \
+                    else np.broadcast_to(bg_rgb / 255.0, (H, W, 3))
+                com = fgr * pha3 + bg * (1 - pha3)
+                enc.stdin.write((np.clip(com, 0, 1) * 255).astype(np.uint8).tobytes())
+            elif args.mode == "mask":
+                Image.fromarray((np.clip(pha, 0, 1) * 255).astype(np.uint8), "L") \
+                    .save(frame_out_dir / f"mask-{fcount:05d}.png")
+            else:  # alpha：前景 + 透明通道
+                rgba = np.concatenate([(np.clip(fgr, 0, 1) * 255).astype(np.uint8),
+                                       (np.clip(pha, 0, 1) * 255).astype(np.uint8)[:, :, None]], axis=2)
+                Image.fromarray(rgba, "RGBA").save(frame_out_dir / f"alpha-{fcount:05d}.png")
+            fcount += 1
+            if fcount % 30 == 0:
+                el = time.time() - t0
+                print(f"\r[matte] {fcount} 帧  {fcount/max(el,1e-6):.1f} fps", end="", file=sys.stderr, flush=True)
+    finally:
+        dec.stdout.close()
+        dec.wait()
+        if enc is not None:
+            enc.stdin.close()
+            enc_err = enc.stderr.read()
+            enc.wait()
+    elapsed = max(time.time() - t0, 1e-6)
+    print("", file=sys.stderr, flush=True)
+
+    final_out = out
+    if args.mode == "alpha":
+        final_out = out.with_suffix(".webm")
+        run_ff([ff, "-hide_banner", "-loglevel", "error", "-y", "-framerate", f"{fps:.3f}",
+                "-i", str(frame_out_dir / "alpha-%05d.png"), "-c:v", "libvpx-vp9",
+                "-pix_fmt", "yuva420p", "-crf", "30", "-b:v", "0", "-auto-alt-ref", "0", str(final_out)])
+    elif args.mode == "mask":
+        run_ff([ff, "-hide_banner", "-loglevel", "error", "-y", "-framerate", f"{fps:.3f}",
+                "-i", str(frame_out_dir / "mask-%05d.png"), "-c:v", "libx264",
+                "-preset", "veryfast", "-crf", str(args.crf), "-pix_fmt", "gray", str(final_out)])
+
+    result = {
+        "output": str(final_out),
+        "backend": f"rvm:{args.model}",
+        "providers": providers,
+        "size": f"{W}x{H}", "fps": round(fps, 2), "frames": fcount,
+        "seconds": round(elapsed, 1),
+        "matting_fps": round(fcount / elapsed, 2),
+        "mode": args.mode,
+        "background": args.bg_color or (str(args.bg_image) if args.bg_image else None),
+        "alpha_smooth": args.alpha_smooth,
+        "frames_dir": str(frame_out_dir) if args.mode in ("alpha", "mask") else None,
+        "encode_error": (enc_err.decode("utf-8", "replace")[:300] if enc_err else None),
+    }
+    if args.compare and fcount:
+        result["compare"] = export_compare_frames(ff, src, final_out, Path(args.compare_dir or out.parent),
+                                                  Path(src).stem + "-matte", args.json)
+    emit(result, args.json)
+    return 0 if fcount else 2
+
+
+def export_compare_frames(ff: str, before, after, out_dir: Path, stem: str, as_json: bool) -> dict:
+    """导出前后对比帧 + 接触表（本模型路线看不到画面，交付前必须由人过目）。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pairs = []
+    for label, path in (("before", before), ("after", after)):
+        f = out_dir / f"{stem}-{label}.jpg"
+        run_ff([ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", "1", "-i", str(path),
+                "-frames:v", "1", "-q:v", "2", str(f)])
+        if f.exists():
+            pairs.append(str(f))
+    sheet = out_dir / f"{stem}-compare.jpg"
+    code, _out, err = _run_cli(["sheet", *pairs, "--out", str(sheet), "--cols", "2", "--labels"])
+    return {"frames": pairs, "sheet": str(sheet) if sheet.exists() else None,
+            "error": None if code == 0 else err[:200]}
+
+
+# ---------------------------- 动效文字（ASS） ----------------------------
+
+# 九宫格 -> ASS \an（数字键盘布局）
+ASS_ANCHOR = {"tl": 7, "tc": 8, "tr": 9, "ml": 4, "mc": 5, "mr": 6, "bl": 1, "bc": 2, "br": 3}
+
+TEXT_PRESETS = (
+    "fade",          # 淡入淡出
+    "slide-up",      # 自下而上滑入
+    "slide-down",    # 自上而下滑入
+    "slide-left",    # 自右向左滑入
+    "slide-right",   # 自左向右滑入
+    "typewriter",    # 逐字打出
+    "pop",           # 缩放弹出
+    "bounce",        # 弹跳落定
+    "karaoke",       # 逐词高亮（按空格/字符切词）
+    "lower-third",   # 下三分之一条 + 滑入
+)
+
+
+def ass_color(value: str) -> str:
+    """#RRGGBB / white … -> ASS &HAABBGGRR（alpha 取反）。"""
+    r, g, b, a = parse_color(value)
+    return f"&H{255 - a:02X}{b:02X}{g:02X}{r:02X}"
+
+
+def _ass_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h:d}:{m:02d}:{s:05.2f}"
+
+
+def _grid_pos(position: str, W: int, H: int, margin: int, bottom_margin: int) -> tuple[int, int]:
+    fx = {"l": 0.0, "c": 0.5, "r": 1.0}[(position[1] if len(position) > 1 else "c")]
+    fy = {"t": 0.0, "m": 0.5, "b": 1.0}[(position[0] if position else "c")]
+    x = int(margin + fx * (W - 2 * margin))
+    y = int(margin + fy * ((H - bottom_margin) - margin)) if fy < 1.0 else int(H - bottom_margin)
+    return x, y
+
+
+def build_text_block(block: dict, W: int, H: int, defaults: dict) -> str:
+    """把一条文案块编译成 ASS Dialogue 行（含动效标签）。"""
+    text = str(block.get("text", "")).strip()
+    if not text:
+        return ""
+    start = float(block.get("start", 0.0))
+    end = float(block.get("end", start + 3.0))
+    if end <= start:
+        end = start + 3.0
+    preset = block.get("preset", defaults["preset"])
+    position = block.get("position", defaults["position"])
+    size_ratio = float(block.get("size", defaults["size"]))
+    style = block.get("style", defaults.get("style", "Default"))
+    color = ass_color(block.get("color", defaults["color"]))
+    dur_ms = int((end - start) * 1000)
+
+    an = ASS_ANCHOR.get(position, 2)
+    x, y = _grid_pos(position, W, H, int(block.get("margin", defaults["margin"])),
+                     int(block.get("bottom_margin", defaults["bottom_margin"])))
+
+    tags = [f"\\an{an}", f"\\pos({x},{y})", f"\\fs{max(12, int(H * size_ratio))}"]
+    body = text
+
+    if preset == "fade":
+        tags.append("\\fad(400,400)")
+    elif preset.startswith("slide-"):
+        dist = int(H * 0.12)
+        frm = {"slide-up": (x, y + dist), "slide-down": (x, y - dist),
+               "slide-left": (x + dist * 2, y), "slide-right": (x - dist * 2, y)}[preset]
+        tags.append(f"\\move({frm[0]},{frm[1]},{x},{y},0,500)")
+        tags.append("\\fad(300,300)")
+    elif preset == "pop":
+        tags.append("\\fscx60\\fscy60")
+        tags.append("\\t(0,260,\\fscx104\\fscy104)")
+        tags.append("\\t(260,400,\\fscx100\\fscy100)")
+    elif preset == "bounce":
+        tags.append(f"\\move({x},{max(0, y - int(H * 0.10))},{x},{y},0,420)")
+        tags.append("\\t(420,520,\\fscx106\\fscy94)")
+        tags.append("\\t(520,640,\\fscx100\\fscy100)")
+    elif preset == "typewriter":
+        step = max(30, int(dur_ms * 0.55 / max(len(text), 1)))
+        out = []
+        for i, ch in enumerate(text):
+            t0 = i * step
+            out.append(f"{{\\alpha&HFF&\\t({t0},{t0 + 40},\\alpha&H00&)}}{ch}")
+        body = "".join(out)
+    elif preset == "karaoke":
+        words = [w for w in text.split(" ") if w]
+        if len(words) == 1:  # 中文按字切
+            words = list(text)
+            joiner = ""
+        else:
+            joiner = " "
+        per = max(20, int(dur_ms * 0.8 / max(len(words), 1)))
+        body = joiner.join(f"{{\\k{per // 10}}}{w}" for w in words)
+    elif preset == "lower-third":
+        tags.append(f"\\move({max(0, x - int(W * 0.15))},{y},{x},{y},0,420)")
+        tags.append("\\fad(300,300)")
+        tags.append("\\bord0\\shad0")
+
+    return (f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style},,0,0,0,,"
+            f"{{{''.join(tags)}}}{body}")
+
+
+def build_ass(blocks: list[dict], W: int, H: int, defaults: dict) -> str:
+    head = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {W}
+PlayResY: {H}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.601
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{defaults['font']},{max(12, int(H * defaults['size']))},{ass_color(defaults['color'])},{ass_color(defaults['highlight'])},{ass_color(defaults['stroke'])},{ass_color(defaults['box']) if defaults.get('box_style') else '&H80000000'},0,0,0,0,100,100,0,0,{1 if defaults.get('box_style') else 1},{defaults['outline']},{defaults['shadow']},2,40,40,40,1
+Style: Boxed,{defaults['font']},{max(12, int(H * defaults['size']))},{ass_color(defaults['color'])},{ass_color(defaults['highlight'])},{ass_color(defaults['stroke'])},{ass_color(defaults['box'])},0,0,0,0,100,100,0,0,3,{defaults['outline']},{defaults['shadow']},2,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [l for l in (build_text_block(b, W, H, defaults) for b in blocks) if l]
+    return head + "\n".join(lines) + "\n"
+
+
+def cmd_video_text_anim(args) -> int:
+    """动效文字：生成 ASS（淡入/滑入/打字机/卡拉OK/弹出…）并可一键烧入视频。"""
+    ff = find_ffmpeg()
+    blocks: list[dict] = []
+    W = args.width or 1080
+    H = args.height or 1920
+
+    if args.spec:
+        spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+        if isinstance(spec, dict):
+            blocks = spec.get("blocks", [])
+            W = int(spec.get("width", W))
+            H = int(spec.get("height", H))
+        else:
+            blocks = spec
+
+    if args.input:
+        if not ff:
+            warn_tier("video", "pip install imageio-ffmpeg")
+            return 3
+        data = ffprobe_json(ff, args.input)
+        v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+        W, H = int(v.get("width") or W), int(v.get("height") or H)
+
+    if args.text:
+        blocks.append({
+            "text": args.text.replace("\\n", "\n"),
+            "start": float(parse_time(args.start) or 0.0),
+            "end": float(parse_time(args.end) or ((parse_time(args.start) or 0.0) + (parse_time(args.duration) or 3.0))),
+            "preset": args.preset,
+            "position": args.position,
+            "size": args.size_ratio,
+            "color": args.color,
+        })
+    if not blocks:
+        print("需要 --text 或 --spec 提供文案", file=sys.stderr)
+        return 2
+
+    defaults = {
+        "font": args.font_name or ("Microsoft YaHei" if os.name == "nt" else "Noto Sans CJK SC"),
+        "size": args.size_ratio,
+        "color": args.color,
+        "highlight": args.highlight,
+        "stroke": args.stroke,
+        "box": args.box or "#00000099",
+        "box_style": bool(args.box),
+        "style": "Boxed" if args.box else "Default",
+        "outline": args.outline,
+        "shadow": args.shadow,
+        "preset": args.preset,
+        "position": args.position,
+        "margin": int(H * 0.06),
+        "bottom_margin": int(H * (0.20 if H > W else 0.12)),
+    }
+
+    ass_path = Path(args.ass_out or (Path(args.input).with_suffix(".anim.ass") if args.input else "titles.anim.ass"))
+    ass_path.write_text(build_ass(blocks, W, H, defaults), encoding="utf-8")
+    result = {"ass": str(ass_path), "canvas": f"{W}x{H}", "blocks": len(blocks),
+              "presets": sorted({b.get("preset", defaults["preset"]) for b in blocks})}
+
+    if args.input and not args.ass_only:
+        out = Path(args.out or Path(args.input).with_name(Path(args.input).stem + "-titles.mp4"))
+        sub_escaped = str(ass_path).replace("\\", "/").replace(":", r"\:")
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", args.input,
+               "-vf", f"ass='{sub_escaped}'", "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", str(args.crf), "-pix_fmt", "yuv420p", "-c:a", "copy",
+               "-movflags", "+faststart", str(out)]
+        code, err = run_ff(cmd)
+        result.update({"output": str(out), "burn_error": None if code == 0 else err[:400]})
+        if args.compare and code == 0:
+            result["compare"] = export_compare_frames(ff, args.input, out, Path(args.compare_dir or out.parent),
+                                                      Path(args.input).stem + "-titles", args.json)
+    emit(result, args.json)
+    return 0
+
+
+# ---------------------------- 光效与调色预设 ----------------------------
+
+# 每个预设是一段 filter_complex 片段：{inp} 为输入标签，{out} 为输出标签
+FX_PRESETS = {
+    "glow":        "{inp}split=2[ga][gb];[ga]gblur=sigma=20[gg];[gg][gb]blend=all_mode=screen:all_opacity=0.55{out}",
+    "bloom":       "{inp}split=2[ba][bb];[ba]curves=all='0/0 0.55/0.78 1/1',gblur=sigma=28[bg];[bg][bb]blend=all_mode=screen:all_opacity=0.6{out}",
+    "soft-focus":  "{inp}split=2[sa][sb];[sa]gblur=sigma=12[sg];[sg][sb]blend=all_mode=screen:all_opacity=0.25{out}",
+    "leak":        "{inp}[leakin]overlay=0:0:shortest=1{out}",
+    "trail":       "{inp}tmix=frames=6:weights='1 1 2 3 5 8'{out}",
+    "grain":       "{inp}noise=alls=9:allf=t{out}",
+    "vignette":    "{inp}vignette=PI/5{out}",
+    "sharpen":     "{inp}unsharp=5:5:1.0:5:5:0.0{out}",
+    "warm":        "{inp}colorbalance=rs=0.06:gs=0.02:bs=-0.06,eq=saturation=1.06{out}",
+    "cool":        "{inp}colorbalance=rs=-0.06:gs=0.0:bs=0.08,eq=saturation=0.98{out}",
+    "teal-orange": "{inp}colorbalance=rs=0.12:gs=-0.02:bs=-0.10,colorbalance=rh=-0.06:bh=0.10,"
+                   "eq=contrast=1.06:saturation=1.08{out}",
+    "film":        "{inp}curves=all='0/0.02 0.5/0.5 1/0.98',noise=alls=6:allf=t,vignette=PI/4.5{out}",
+    "punch":       "{inp}eq=contrast=1.12:saturation=1.12:brightness=0.02,unsharp=5:5:0.8{out}",
+}
+
+FX_NOTES = {
+    "glow": "柔光晕：模糊层 screen 叠加",
+    "bloom": "高光泛光：先提亮高光再模糊叠加",
+    "soft-focus": "轻柔焦：低透明度叠加（人像/产品）",
+    "leak": "光泄漏：叠加程序化渐变光斑（可调 --leak-opacity）",
+    "trail": "运动拖影：6 帧加权混合",
+    "grain": "胶片颗粒",
+    "vignette": "暗角",
+    "sharpen": "锐化",
+    "warm": "暖调",
+    "cool": "冷调",
+    "teal-orange": "电影感青橙",
+    "film": "胶片感：轻微压缩+颗粒+暗角",
+    "punch": "增强对比与饱和（电商图更抓眼）",
+}
+
+
+def cmd_video_fx(args) -> int:
+    """光效与调色：辉光/泛光/光泄漏/拖影/颗粒/暗角/冷暖/青橙/LUT。"""
+    if args.list and not args.preset:
+        emit({"presets": [{"name": k, "note": FX_NOTES.get(k, "")} for k in FX_PRESETS]}, args.json)
+        return 0
+    ff = find_ffmpeg()
+    if not ff:
+        warn_tier("video", "pip install imageio-ffmpeg")
+        return 3
+
+    names: list[str] = []
+    for p in (args.preset or []):
+        names += [x.strip() for x in str(p).split(",") if x.strip()]
+    unknown = [n for n in names if n not in FX_PRESETS]
+    if unknown:
+        print(f"UNKNOWN_PRESET: {', '.join(unknown)}；可用：{', '.join(FX_PRESETS)}", file=sys.stderr)
+        return 2
+    if names and not args.input:
+        print("需要 input（或在仅列清单时使用 --list）", file=sys.stderr)
+        return 2
+    if not names and not args.lut:
+        print("需要 --preset（可多个）或 --lut", file=sys.stderr)
+        return 2
+
+    src = args.input
+    data = ffprobe_json(ff, src)
+    v = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), {})
+    W, H = int(v.get("width") or 1080), int(v.get("height") or 1920)
+    limit = parse_time(args.limit) if args.limit else None
+    out = Path(args.out or Path(src).with_name(Path(src).stem + "-fx.mp4"))
+
+    stages: list[str] = []
+    uses_leak = "leak" in names
+    if uses_leak:
+        # 光泄漏：用 lavfi gradients 生成慢速流动的暖色光（比逐像素 geq 快两个数量级），
+        # 透明度用 colorchannelmixer 控制，overlay 加 shortest 防止无限源拖死编码。
+        op = max(0.0, min(1.0, args.leak_opacity))
+        stages.append(f"[1:v]format=rgba,colorchannelmixer=aa={op:.2f}[leakin]")
+    cur = "[0:v]"
+    for i, nm in enumerate(names):
+        outl = f"[fx{i}]"
+        stages.append(FX_PRESETS[nm].format(inp=cur, out=outl))
+        cur = outl
+    if args.lut:
+        lut_path = str(Path(args.lut).resolve()).replace("\\", "/").replace(":", r"\:")
+        outl = f"[fx{len(names)}]"
+        stages.append(f"{cur}lut3d=file='{lut_path}'{outl}")
+        cur = outl
+    stages.append(f"{cur}format=yuv420p[vout]")
+
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-y"]
+    if limit:
+        cmd += ["-t", f"{limit:.3f}"]
+    cmd += ["-i", src]
+    if uses_leak:
+        dur = limit or float(data.get("format", {}).get("duration", 0) or 5.0)
+        cmd += ["-f", "lavfi", "-i",
+                f"gradients=s={W}x{H}:c0=0x2a1200:c1=0xff8a3c:c2=0xff3cac:"
+                f"x0=0:y0=0:x1={W}:y1={H}:d={max(1.0, dur):.3f}:speed=0.012:n=3"]
+    cmd += ["-filter_complex", ";".join(stages), "-map", "[vout]", "-map", "0:a?"]
+    if limit:
+        cmd += ["-t", f"{limit:.3f}"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+            "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", str(out)]
+    code, err = run_ff(cmd)
+    result = {"output": str(out), "presets": names, "lut": args.lut,
+              "size": f"{W}x{H}", "error": None if code == 0 else err[:400]}
+    if args.compare and code == 0:
+        result["compare"] = export_compare_frames(ff, src, out, Path(args.compare_dir or out.parent),
+                                                  Path(src).stem + "-fx", args.json)
+    emit(result, args.json)
+    return 0 if code == 0 else 2
+
+
 # ---------------------------- 自检 / 验收 ----------------------------
 
 def _run_cli(argv: list[str]) -> tuple[int, str, str]:
@@ -1359,6 +1993,66 @@ def cmd_selftest(args) -> int:
     check("T2 video-export (9:16)", code == 0 and p.get("width") == 1080 and p.get("height") == 1920,
           f"{p.get('width')}x{p.get('height')} {err}")
 
+    # ---------- T3 视频特效（抠像换背景 / 动效文字 / 转场 / 光效）----------
+    vfx_in = clip1
+    if ff and vfx_in.exists():
+        m1 = work / "fx-matte.mp4"
+        code, _, err = call(["video-matte", str(vfx_in), "--limit", "1", "--bg-color", "white",
+                             "--out", str(m1)])
+        white_ok = False
+        if m1.exists() and code == 0:
+            try:
+                import numpy as np
+                f = work / "fx-matte-frame.jpg"
+                run_ff([ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", "0.5", "-i", str(m1),
+                        "-frames:v", "1", "-q:v", "2", str(f)])
+                if f.exists():
+                    im = np.asarray(Image.open(f).convert("RGB"), dtype=np.int16)
+                    h, w, _ = im.shape
+                    corners = np.concatenate([im[2:6, 2:6].reshape(-1, 3), im[2:6, w-6:w-2].reshape(-1, 3),
+                                              im[h-6:h-2, 2:6].reshape(-1, 3), im[h-6:h-2, w-6:w-2].reshape(-1, 3)])
+                    white_ok = bool(corners.min() > 225)
+            except Exception:
+                white_ok = False
+        check("T3 video-matte (AI 抠像→白底)", code == 0 and white_ok,
+              "四角像素已被替换为白底" if white_ok else err[:200])
+
+        mc = work / "fx-chromakey.mp4"
+        code, _, err = call(["video-matte", str(vfx_in), "--backend", "chromakey", "--key-color",
+                             "0x00FF00", "--bg-color", "white", "--limit", "1", "--out", str(mc)])
+        check("T3 video-matte (色键路径)", code == 0 and mc.exists(), err[:200])
+
+        ta = work / "fx-titles.mp4"
+        ass = work / "fx-titles.ass"
+        code, _, err = call(["video-text-anim", str(vfx_in), "--text", "自检标题\nSelf Test Title",
+                             "--preset", "slide-up", "--start", "0.2", "--end", "1.2",
+                             "--ass-out", str(ass), "--out", str(ta)])
+        ass_ok = ass.exists() and "Dialogue:" in ass.read_text(encoding="utf-8", errors="replace")
+        check("T3 video-text-anim (ASS+烧入)", code == 0 and ass_ok and ta.exists(), err[:200])
+
+        code, out, err = call(["video-join", "--list-transitions"])
+        n_x = len(json.loads(out).get("xfade", [])) if code == 0 and out.strip().startswith("{") else 0
+        check("T3 video-transition 清单", n_x >= 40, f"可用 xfade 转场 {n_x} 种")
+
+        j1, j2, jout = work / "fx-j1.mp4", work / "fx-j2.mp4", work / "fx-glitch.mp4"
+        call(["video-cut", str(vfx_in), "--start", "0.5", "--duration", "1.5", "--accurate", "--out", str(j1)])
+        call(["video-cut", str(vfx_in), "--start", "2.0", "--duration", "1.5", "--accurate", "--out", str(j2)])
+        code, _, err = call(["video-join", str(j1), str(j2), "--transition", "glitch",
+                             "--transition-duration", "0.5", "--out", str(jout)])
+        p = _probe(jout)
+        check("T3 video-transition (风格化 glitch)", code == 0 and abs(p.get("duration", 0) - 2.5) < 0.4,
+              f"dur={p.get('duration')} {err[:150]}")
+
+        fxo = work / "fx-look.mp4"
+        code, _, err = call(["video-fx", str(vfx_in), "--preset", "teal-orange,glow", "--limit", "1",
+                             "--compare", "--out", str(fxo)])
+        sheet = work / "clip-a-fx-compare.jpg"
+        check("T3 video-fx (调色+辉光+对比帧)", code == 0 and fxo.exists() and sheet.exists(), err[:200])
+
+        fxl = work / "fx-leak.mp4"
+        code, _, err = call(["video-fx", str(vfx_in), "--preset", "leak", "--limit", "1", "--out", str(fxl)])
+        check("T3 video-fx (光泄漏)", code == 0 and fxl.exists(), err[:200])
+
     # ---------- 汇总 ----------
     passed = sum(1 for r in results if r["ok"])
     total = len(results)
@@ -1489,14 +2183,30 @@ def build_parser() -> argparse.ArgumentParser:
     vc.set_defaults(func=cmd_video_cut)
 
     vj = sub.add_parser("video-join", help="视频拼接（默认无损 copy；--transition 加转场重编码）")
-    vj.add_argument("inputs", nargs="+")
+    vj.add_argument("inputs", nargs="*")
     vj.add_argument("--out")
     vj.add_argument("--transition", default="none",
-                    help="none|fade|wipeleft|wiperight|slideup|slidedown|circleopen|dissolve")
+                    help="none|fade|wipeleft|slideup|circleopen|dissolve|… (46 种 xfade) "
+                         "或风格化预置 flash|glitch|whip-pan|soft-zoom|film-burn")
+    vj.add_argument("--list-transitions", action="store_true", help="列出全部可用转场与风格化预置")
     vj.add_argument("--transition-duration", type=float, default=0.5)
     vj.add_argument("--fps", type=int, default=30, help="转场拼接时的统一帧率")
     vj.add_argument("--reencode", action="store_true", help="无转场时也重编码（参数不一致时用）")
     vj.set_defaults(func=cmd_video_join)
+
+    fx = sub.add_parser("video-fx", help="光效与调色预设（辉光/泛光/光泄漏/拖影/颗粒/暗角/LUT）")
+    fx.add_argument("input", nargs="?", help="输入视频；配合 --list 时可省略")
+    fx.add_argument("--preset", action="append", required=False,
+                    help="可重复或逗号分隔：" + ",".join(FX_PRESETS))
+    fx.add_argument("--list", action="store_true", help="列出全部光效/调色预设说明")
+    fx.add_argument("--lut", help="3D LUT 文件（.cube/.3dl）")
+    fx.add_argument("--leak-opacity", type=float, default=0.35, help="光泄漏叠加不透明度")
+    fx.add_argument("--limit", help="只处理前 N 秒（试跑）")
+    fx.add_argument("--crf", type=int, default=20)
+    fx.add_argument("--compare", action="store_true", help="导出前后对比帧 + 接触表")
+    fx.add_argument("--compare-dir")
+    fx.add_argument("--out")
+    fx.set_defaults(func=cmd_video_fx)
 
     vsub = sub.add_parser("video-subtitle", help="烧入字幕（SRT/ASS，可调字体/描边/位置）")
     vsub.add_argument("input")
@@ -1563,6 +2273,56 @@ def build_parser() -> argparse.ArgumentParser:
     ve.add_argument("--out")
     ve.add_argument("--out-dir")
     ve.set_defaults(func=cmd_video_export)
+
+    vm = sub.add_parser("video-matte", help="视频抠像换背景：AI（RVM，任意背景）或色键（绿幕）")
+    vm.add_argument("input")
+    vm.add_argument("--backend", default="auto", choices=["auto", "rvm", "chromakey"])
+    vm.add_argument("--model", default="mobilenetv3", choices=sorted(RVM_MODELS))
+    vm.add_argument("--mode", default="composite", choices=["composite", "alpha", "mask"],
+                    help="composite=换背景出成片 / alpha=输出带透明通道的 webm / mask=输出黑白遮罩")
+    vm.add_argument("--bg-color", help="背景底色，如 white / #1F6E43")
+    vm.add_argument("--bg-image", help="背景图（自动缩放到视频尺寸）")
+    vm.add_argument("--key-color", help="色键颜色，如 0x00FF00（给了就走色键路径）")
+    vm.add_argument("--key-similarity", type=float, default=0.3)
+    vm.add_argument("--key-blend", type=float, default=0.1)
+    vm.add_argument("--despill", help="去溢色类型：green / blue")
+    vm.add_argument("--downsample-ratio", type=float, default=0.375, help="RVM 推理分辨率比例（越小越快）")
+    vm.add_argument("--alpha-smooth", type=float, default=0.25, help="时间平滑系数，抑制边缘闪烁（0=关）")
+    vm.add_argument("--limit", help="只处理前 N 秒（快速试跑）")
+    vm.add_argument("--crf", type=int, default=20)
+    vm.add_argument("--gpu", action="store_true", help="要求 CUDA provider（缺失会提示回退）")
+    vm.add_argument("--compare", action="store_true", help="导出前后对比帧 + 接触表")
+    vm.add_argument("--compare-dir")
+    vm.add_argument("--frames-dir")
+    vm.add_argument("--out")
+    vm.set_defaults(func=cmd_video_matte)
+
+    ta = sub.add_parser("video-text-anim", help="动效文字：ASS 生成（淡入/滑入/打字机/卡拉OK/弹出）并可烧入")
+    ta.add_argument("input", nargs="?", help="要烧入的视频；省略则只生成 ASS")
+    ta.add_argument("--text", help="单条文案（\\n 换行）")
+    ta.add_argument("--spec", help="多条文案 JSON：[{text,start,end,preset,position,size,color}]")
+    ta.add_argument("--preset", default="fade", choices=list(TEXT_PRESETS))
+    ta.add_argument("--position", default="bc", choices=sorted(ASS_ANCHOR))
+    ta.add_argument("--start")
+    ta.add_argument("--end")
+    ta.add_argument("--duration")
+    ta.add_argument("--size-ratio", type=float, default=0.055, help="字号占画面高度比例")
+    ta.add_argument("--color", default="white")
+    ta.add_argument("--highlight", default="#FFD54A", help="卡拉OK 高亮色")
+    ta.add_argument("--stroke", default="#000000")
+    ta.add_argument("--outline", type=float, default=2.0)
+    ta.add_argument("--shadow", type=float, default=0.0)
+    ta.add_argument("--box", help="底块颜色（如 #00000099），设置后文字带底色块")
+    ta.add_argument("--font-name")
+    ta.add_argument("--width", type=int, help="无输入视频时指定画布宽")
+    ta.add_argument("--height", type=int, help="无输入视频时指定画布高")
+    ta.add_argument("--ass-out", help="指定 ASS 输出路径")
+    ta.add_argument("--ass-only", action="store_true", help="只产出 ASS，不烧入")
+    ta.add_argument("--crf", type=int, default=20)
+    ta.add_argument("--compare", action="store_true")
+    ta.add_argument("--compare-dir")
+    ta.add_argument("--out")
+    ta.set_defaults(func=cmd_video_text_anim)
 
     st = sub.add_parser("selftest", help="端到端验收：自造素材跑全部命令并核对产物")
     st.add_argument("--work-dir", help="验收工作目录（默认 tests/out/selftest）")

@@ -1,0 +1,5 @@
+{"width":568,"height":320,"blocks":[
+ {"text":"SHOTO 多燃料炉","start":0.3,"end":2.2,"preset":"typewriter","position":"tc","size":0.11,"color":"white","stroke":"#1F6E43"},
+ {"text":"颗粒 木柴 秸秆 木炭","start":2.2,"end":4.5,"preset":"karaoke","position":"bc","size":0.085,"color":"white","highlight":"#FFD54A"},
+ {"text":"FOB Ningbo · OEM","start":4.5,"end":6.0,"preset":"pop","position":"mc","size":0.09,"color":"#FFD54A"}
+]}

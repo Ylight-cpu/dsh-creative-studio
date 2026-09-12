@@ -1,5 +1,20 @@
 # dsh-creative-studio — 建设状态（2026-09-11；发布记录更新至 2026-09-12）
 
+## 0.2.0 — 四组视频特效（2026-09-12）
+
+用户要求"抠像换背景 / 文字动效 / 转场 / 光效"四类全部由本插件覆盖。结论：**四类全部实现并实测**，边界如实标注。
+
+| 能力 | 命令 | 实现与实测 |
+|---|---|---|
+| 视频抠像换背景 | `video-matte` | RVM ONNX（mobilenetv3 14MB / resnet50 102MB，首次自动下载到 `~/.dsh-creative-studio/models`）；RVM 循环状态 + `--alpha-smooth` 时域平滑；三种输出 composite/alpha(VP9 yuva420p)/mask；绿幕走 `--backend chromakey` 无模型。**实测 CPU 568×320 = 81 fps、720×1280 = 17 fps；换白底后画面四角 (90,91,98) → (255,255,255)** |
+| 动效文字 | `video-text-anim` | 生成标准 ASS（10 预设：fade / 四向 slide / typewriter（逐字符 α 时间标签）/ pop / bounce / karaoke（\k 逐词、中文按字）/ lower-third），可只出 ASS 或直接烧入；安全区按竖版 20% / 横版 12% 留白。**客观验证：底部亮像素 0.0000 → 0.0101** |
+| 转场 | `video-join --transition` | 从 ffmpeg 自身枚举 **53 种** xfade（不写死）；5 个风格化预置：flash(fadewhite) / glitch(色偏+噪点→pixelize) / whip-pan(拖影→smoothleft) / soft-zoom(模糊→fade) / film-burn(暖偏+颗粒→fadeblack)，用 trim+效果+concat 实现局部效果，不依赖滤镜时间轴支持。**实测各 0.4s；3+3−0.6=5.44s 时长校验通过** |
+| 光效调色 | `video-fx --preset` | 13 预设（glow/bloom/soft-focus/leak/trail/grain/vignette/sharpen/warm/cool/teal-orange/film/punch），可串联，支持 `--lut`；`--compare` 出前后帧+接触表。**踩坑并修复**：初版用 `geq` 逐像素表达式生成光斑，CPU 上 10 分钟超时 → 改用 lavfi `gradients` + `shortest` + 输出端限时，降到 **0.4s** |
+
+**验收**：`selftest` 由 19 项扩到 **26/26 通过**（新增 7 项：AI 抠像换白底[四角像素客观判定]、色键路径、ASS 动效文字、转场清单≥40、风格化 glitch 时长、调色+辉光+对比帧、光泄漏）。
+
+**诚实边界（写进技能文档）**：运动跟踪、3D 相机、粒子系统、复杂 roto 遮罩仍需 After Effects——ffmpeg + 现有模型做不到，不做含糊替代。
+
 ## 发布状态（2026-09-12）
 
 | 项 | 状态 | 证据 |

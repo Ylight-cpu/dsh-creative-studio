@@ -26,7 +26,22 @@ node "$pkg\scripts\run-toolkit.mjs" doctor --json     # confirm the video tier a
 ```
 
 ffmpeg ships inside the runtime (`imageio-ffmpeg`) — never install system ffmpeg or describe an edit you did not perform.
-**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` (18 checks, includes cut/join/subtitles/export). Non-zero exit = broken capability here: report it.
+**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` (26 checks, includes matting, animated text, transitions, light effects, subtitles and exports). Non-zero exit = broken capability here: report it.
+
+## Effects you can produce here (no CapCut / Premiere required)
+
+Four capability groups, all driven by the same CLI — see `reference/commands.md` for every flag:
+
+| Need | Command | Notes |
+|---|---|---|
+| **抠像换背景** — cut a subject out of any background and drop it on white, a colour, an image or another clip | `video-matte` | AI path = RVM ONNX (auto-downloads 14 MB; ~81 fps at 568×320 on CPU, ~17 fps at 720×1280). Green-screen footage: `--backend chromakey` needs no model. `--mode alpha` writes a transparent WebM, `--mode mask` a black-and-white matte. |
+| **文字动效** — headline animations | `video-text-anim` | Presets: `fade`, `slide-up/down/left/right`, `typewriter`, `pop`, `bounce`, `karaoke` (word highlight), `lower-third`. Generates an ASS file (keep it, edit it, re-burn) or burns straight in. |
+| **转场** — 53 native `xfade` transitions plus stylized ones | `video-join --transition …` | `--list-transitions` prints the catalogue. Stylized presets: `glitch` (RGB-split + noise + pixelize), `whip-pan` (motion smear + smooth slide), `flash` (fade-to-white), `soft-zoom` (blur-in), `film-burn` (warm shift + grain + fade-to-black). |
+| **光效 / 调色** — glow, bloom, light leaks, trails, looks | `video-fx --preset …` | `glow`, `bloom`, `soft-focus`, `leak`, `trail`, `grain`, `vignette`, `sharpen`, `warm`, `cool`, `teal-orange`, `film`, `punch`; chain them (`--preset teal-orange,glow,film`) and add a real LUT with `--lut look.cube`. |
+
+**Honest ceiling.** ffmpeg + these models give you matting, animated text, transitions and light effects at deliverable quality. They do **not** give you motion tracking (pinning text to a moving object), 3D camera moves, particle systems, or complex rotoscoping — those need After Effects. Say so instead of approximating silently.
+
+**Always hand over comparison frames.** You cannot see the picture on most routes, so for any effect run `--compare` (before/after frames + a contact sheet) and let the user judge; never assert that an effect "looks good".
 
 ## Three stages — never skip stage 1
 
