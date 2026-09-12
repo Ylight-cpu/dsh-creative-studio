@@ -1,6 +1,6 @@
 {
   "name": "dsh-creative-studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH × Creative Studio — a portable AI image-retouching and video-editing skill pack for DeepSeek Harness: background removal with quality tiers, inpainting retouch, text/logo compositing, batch platform exports, footage review, storyboards and timeline editing. · 美工 + 视频剪辑技能包：抠图/改图/文字/logo/合成/批量规格化 + 素材通览/脚本/剪辑/字幕/配乐/封面。",
   "type": "module",
   "main": "./lib/index.js",
@@ -11,6 +11,7 @@
     "scripts",
     "docs",
     "cordis.patch.yml",
+    "CHANGELOG.md",
     "README.md"
   ],
   "exports": {

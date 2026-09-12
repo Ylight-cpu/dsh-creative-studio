@@ -1378,7 +1378,10 @@ def _fps_of(v: dict) -> float:
 
 
 def cmd_video_matte(args) -> int:
-    """视频抠像换背景：AI（RVM ONNX，任意背景）或色键（绿幕，纯 ffmpeg）。"""
+    """视频抠像换背景：AI 逐帧（rembg 通用 / RVM 人像）或色键（绿幕）。
+
+    所有 AI 输出都过「主体存在性闸门」：覆盖率不达标直接拒绝交付，不产出空视频。
+    """
     ff = find_ffmpeg()
     if not ff:
         warn_tier("video", "pip install imageio-ffmpeg")
@@ -1427,21 +1430,80 @@ def cmd_video_matte(args) -> int:
         emit(result, args.json)
         return 0 if code == 0 else 2
 
-    # ---------- AI 路径（RVM，任意背景）----------
+    # ---------- AI 路径：后端选择（0.2.1 修正）----------
+    # 事故记录（用户实拍素材复现）：0.2.0 的 auto 走 RVM，而 RVM 是【人像/人体】视频抠像模型。
+    # 对供暖炉这类产品素材，它把主体整个判成背景：实测 pha 最大 0.29、>0.5 覆盖率 0.0000，
+    # 同一帧用 rembg isnet 覆盖率 37.97%。于是三版样片里 A 版全白只剩字幕。
+    # 因此 0.2.1 起：auto = rembg 通用逐帧抠像；rvm 只在明确拍人时手动指定。
+    engine = args.backend
+    if engine == "auto":
+        engine = "rembg"
+    if engine == "rvm":
+        return _video_matte_rvm(args, ff, src, W, H, fps, limit, out)
+    return _video_matte_rembg(args, ff, src, W, H, fps, limit, out)
+
+
+VIDEO_MATTE_QUALITY = {"fast": "u2net", "auto": "isnet-general-use", "best": "birefnet-general"}
+EARLY_ABORT_FRAMES = 20
+
+
+def matte_subject_stats(cov: list) -> dict:
+    """前景覆盖率统计——抠像交付的客观依据。"""
     try:
         import numpy as np
-        import onnxruntime as ort
     except Exception:
-        warn_tier("video-matte", "python -m pip install onnxruntime numpy")
-        return 3
+        return {"frames": len(cov)}
+    if not cov:
+        return {"frames": 0, "coverage_mean": 0.0, "coverage_max": 0.0}
+    a = np.asarray(cov, dtype=np.float64)
+    return {
+        "frames": int(a.size),
+        "coverage_mean": round(float(a.mean()), 5),
+        "coverage_min": round(float(a.min()), 5),
+        "coverage_p05": round(float(np.percentile(a, 5)), 5),
+        "coverage_max": round(float(a.max()), 5),
+        "empty_frames": int((a < 0.001).sum()),
+    }
 
-    model_path = ensure_rvm_model(args.model)
-    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
-    if args.gpu and "CUDAExecutionProvider" not in providers:
-        print("提示：未检测到 CUDA provider，回退 CPU（装 onnxruntime-gpu 可加速）", file=sys.stderr)
-    sess = ort.InferenceSession(str(model_path), providers=providers)
-    in_names = [i.name for i in sess.get_inputs()]
-    out_names = [o.name for o in sess.get_outputs()]
+
+def matte_verdict(stats: dict, min_subject: float):
+    """主体存在性闸门。
+
+    抠像最严重的失败不是画质差，而是【主体被整个抠没、输出全白/全透明】——
+    这种东西看起来像成品，实际是废片。所以任何抠像输出必须先过这道客观闸门再谈交付。
+    """
+    if not stats.get("frames"):
+        return "no_frames", "没有解码到任何帧"
+    mean, mx = stats.get("coverage_mean", 0.0), stats.get("coverage_max", 0.0)
+    if mean < min_subject and mx < max(min_subject * 3.0, 0.01):
+        return "subject_not_found", (
+            f"前景覆盖率 mean={mean} max={mx}，低于阈值 {min_subject} —— 主体被判成背景抠没了，"
+            "输出会是空背景，已拒绝交付")
+    if mean > 0.97:
+        return "background_not_removed", (
+            f"前景覆盖率 mean={mean} ≈ 整帧 —— 背景没有被去掉，已拒绝交付")
+    return "ok", None
+
+
+def _reject_matte(args, result: dict, verdict: str, reason: str, frame_out_dir=None) -> int:
+    """拒绝交付：删除不合格产物并明确报错，绝不留下看起来像成品的空视频。"""
+    try:
+        for p in {Path(result.get("output", "")), Path(result.get("output", "")).with_suffix(".webm")}:
+            if str(p) not in ("", ".") and p.exists() and p.is_file():
+                p.unlink()
+    except Exception:
+        pass
+    if frame_out_dir and args.mode in ("alpha", "mask"):
+        shutil.rmtree(str(frame_out_dir), ignore_errors=True)
+    result.update({"status": "rejected", "verdict": verdict, "reason": reason, "output": None})
+    print(f"MATTE_REJECTED[{verdict}]: {reason}", file=sys.stderr)
+    emit(result, args.json)
+    return 2
+
+
+def _video_matte_ai(args, ff, src, W, H, fps, limit, out, alpha_fn, engine, meta) -> int:
+    """逐帧 alpha 推理 → 合成 / 遮罩 / 透明通道，两种后端共用的主循环（含交付闸门）。"""
+    import numpy as np
 
     bg_img = Image.open(args.bg_image).convert("RGB").resize((W, H), Image.LANCZOS) if args.bg_image else None
     bg_rgb = np.array(parse_color(args.bg_color)[:3], dtype=np.float32) if args.bg_color else None
@@ -1469,40 +1531,21 @@ def cmd_video_matte(args) -> int:
     else:
         frame_out_dir.mkdir(parents=True, exist_ok=True)
 
-    rec = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
-    ratio = np.array([args.downsample_ratio], dtype=np.float32)
-    fcount, t0, prev_alpha = 0, time.time(), None
+    fcount, covs, t0, prev_alpha, early = 0, [], time.time(), None, False
     frame_size = W * H * 3
     try:
         while True:
             buf = dec.stdout.read(frame_size)
             if len(buf) < frame_size:
                 break
-            frame = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3).astype(np.float32) / 255.0
-            feeds = {}
-            for nm in in_names:
-                low = nm.lower()
-                if low == "src":
-                    feeds[nm] = frame.transpose(2, 0, 1)[None, :, :, :]
-                elif low == "downsample_ratio":
-                    feeds[nm] = ratio
-                elif low.startswith("r") and low.endswith("i"):
-                    idx = int(low[1]) - 1
-                    if 0 <= idx < 4:
-                        feeds[nm] = rec[idx]
-            outs = sess.run(None, feeds)
-            by_name = dict(zip(out_names, outs))
-            pha = by_name.get("pha", outs[min(1, len(outs) - 1)])[0, 0]
-            fgr = by_name.get("fgr", outs[0])[0].transpose(1, 2, 0)
-            for i in range(4):
-                if f"r{i+1}o" in by_name:
-                    rec[i] = by_name[f"r{i+1}o"]
-            if args.alpha_smooth and prev_alpha is not None:
+            fu8 = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3)
+            pha, fgr = alpha_fn(fu8)
+            if args.alpha_smooth and prev_alpha is not None and getattr(prev_alpha, "shape", None) == getattr(pha, "shape", None):
                 a = args.alpha_smooth
-                pha = a * prev_alpha + (1 - a) * pha
+                pha = a * prev_alpha + (1.0 - a) * pha
             prev_alpha = pha
+            covs.append(float((pha > 0.5).mean()))
             pha3 = pha[:, :, None]
-
             if args.mode == "composite":
                 bg = (np.asarray(bg_img, dtype=np.float32) / 255.0) if bg_img is not None \
                     else np.broadcast_to(bg_rgb / 255.0, (H, W, 3))
@@ -1518,7 +1561,13 @@ def cmd_video_matte(args) -> int:
             fcount += 1
             if fcount % 30 == 0:
                 el = time.time() - t0
-                print(f"\r[matte] {fcount} 帧  {fcount/max(el,1e-6):.1f} fps", end="", file=sys.stderr, flush=True)
+                print(f"\r[matte] {fcount} 帧  {fcount/max(el,1e-6):.1f} fps  "
+                      f"覆盖率 {sum(covs)/len(covs):.3f}", end="", file=sys.stderr, flush=True)
+            # 早期熔断：抠到第 20 帧覆盖率仍恒为 0，说明后端选错了（例如拿人像模型抠产品），
+            # 立刻停下报错，而不是白跑几分钟再产出一个空视频。
+            if fcount == EARLY_ABORT_FRAMES and max(covs) < args.min_subject and not args.allow_empty:
+                early = True
+                break
     finally:
         dec.stdout.close()
         dec.wait()
@@ -1528,6 +1577,27 @@ def cmd_video_matte(args) -> int:
             enc.wait()
     elapsed = max(time.time() - t0, 1e-6)
     print("", file=sys.stderr, flush=True)
+
+    stats = matte_subject_stats(covs)
+    verdict, reason = matte_verdict(stats, args.min_subject)
+    if early:
+        verdict = "subject_not_found"
+        reason = (f"抠到第 {EARLY_ABORT_FRAMES} 帧前景覆盖率始终为 0 —— 后端 {engine} 不适合这条素材，"
+                  "已提前终止（未产出视频）")
+    result = {
+        "output": str(out), "engine": engine, "size": f"{W}x{H}", "fps": round(fps, 2),
+        "frames": fcount, "seconds": round(elapsed, 1), "matting_fps": round(fcount / elapsed, 2),
+        "mode": args.mode, "background": args.bg_color or (str(args.bg_image) if args.bg_image else None),
+        "alpha_smooth": args.alpha_smooth, "subject": stats, "early_abort": early,
+        "gate": {"min_subject": args.min_subject, "verdict": verdict},
+    }
+    result.update(meta)
+    if verdict != "ok" and not args.allow_empty:
+        return _reject_matte(args, result, verdict, reason, frame_out_dir)
+    if verdict != "ok":
+        result["gate_overridden"] = True
+        print(f"警告：主体闸门未通过（{verdict}）但指定了 --allow-empty，仍会输出，请务必人工过目",
+              file=sys.stderr)
 
     final_out = out
     if args.mode == "alpha":
@@ -1540,24 +1610,106 @@ def cmd_video_matte(args) -> int:
                 "-i", str(frame_out_dir / "mask-%05d.png"), "-c:v", "libx264",
                 "-preset", "veryfast", "-crf", str(args.crf), "-pix_fmt", "gray", str(final_out)])
 
-    result = {
-        "output": str(final_out),
-        "backend": f"rvm:{args.model}",
-        "providers": providers,
-        "size": f"{W}x{H}", "fps": round(fps, 2), "frames": fcount,
-        "seconds": round(elapsed, 1),
-        "matting_fps": round(fcount / elapsed, 2),
-        "mode": args.mode,
-        "background": args.bg_color or (str(args.bg_image) if args.bg_image else None),
-        "alpha_smooth": args.alpha_smooth,
-        "frames_dir": str(frame_out_dir) if args.mode in ("alpha", "mask") else None,
-        "encode_error": (enc_err.decode("utf-8", "replace")[:300] if enc_err else None),
-    }
+    result["output"] = str(final_out)
+    result["status"] = "ok"
+    result["frames_dir"] = str(frame_out_dir) if args.mode in ("alpha", "mask") else None
+    result["encode_error"] = (enc_err.decode("utf-8", "replace")[:300] if enc_err else None)
     if args.compare and fcount:
         result["compare"] = export_compare_frames(ff, src, final_out, Path(args.compare_dir or out.parent),
                                                   Path(src).stem + "-matte", args.json)
     emit(result, args.json)
     return 0 if fcount else 2
+
+
+def _video_matte_rembg(args, ff, src, W, H, fps, limit, out) -> int:
+    """通用主体逐帧抠像（rembg：isnet / birefnet / u2net）。
+
+    产品、物体、动物、人都能抠；逐帧独立推理 + alpha 时间平滑抑制闪烁。
+    """
+    try:
+        import numpy as np
+        from rembg import new_session, remove
+    except Exception:
+        warn_tier("video-matte", "python -m pip install rembg onnxruntime numpy")
+        return 3
+
+    model = args.model if (args.model and args.model != "auto") else \
+        VIDEO_MATTE_QUALITY.get(args.quality, "isnet-general-use")
+    if model in RVM_MODELS:
+        print(f"MODEL_ERROR: {model} 是 RVM（人像）模型，请用 --backend rvm，或换 isnet-general-use",
+              file=sys.stderr)
+        return 4
+    try:
+        sess = new_session(model)
+    except Exception as e:
+        print(f"MODEL_ERROR[{model}]: {e}", file=sys.stderr)
+        return 4
+    scale = max(0.1, min(1.0, args.mask_scale))
+    note = ("逐帧通用抠像" if model != "birefnet-general" else
+            "逐帧通用抠像；birefnet 边缘最好，但 CPU 约 6 秒/帧，长片建议先用 --limit 试跑")
+
+    def alpha_fn(fu8):
+        img = Image.fromarray(fu8)
+        if scale < 1.0:
+            img = img.resize((max(2, int(W * scale)), max(2, int(H * scale))), Image.BILINEAR)
+        m = remove(img, session=sess, only_mask=True, post_process_mask=bool(args.post_process_mask))
+        if m.size != (W, H):
+            m = m.resize((W, H), Image.BILINEAR)
+        pha = np.asarray(m, dtype=np.float32) / 255.0
+        return pha, fu8.astype(np.float32) / 255.0
+
+    return _video_matte_ai(args, ff, src, W, H, fps, limit, out, alpha_fn, "rembg",
+                           {"model": model, "note": note, "mask_scale": scale,
+                            "post_process_mask": bool(args.post_process_mask)})
+
+
+def _video_matte_rvm(args, ff, src, W, H, fps, limit, out) -> int:
+    """人像专用后端（RVM ONNX）。只在画面里是【人】时使用；抠产品会得到空背景。"""
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except Exception:
+        warn_tier("video-matte", "python -m pip install onnxruntime numpy")
+        return 3
+
+    model = args.model if args.model in RVM_MODELS else "mobilenetv3"
+    model_path = ensure_rvm_model(model)
+    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                 if p in ort.get_available_providers()]
+    if args.gpu and "CUDAExecutionProvider" not in providers:
+        print("提示：未检测到 CUDA provider，回退 CPU（装 onnxruntime-gpu 可加速）", file=sys.stderr)
+    sess = ort.InferenceSession(str(model_path), providers=providers)
+    in_names = [i.name for i in sess.get_inputs()]
+    out_names = [o.name for o in sess.get_outputs()]
+    rec = [np.zeros([1, 1, 1, 1], dtype=np.float32) for _ in range(4)]
+    ratio = np.array([args.downsample_ratio], dtype=np.float32)
+
+    def alpha_fn(fu8):
+        frame = fu8.astype(np.float32) / 255.0
+        feeds = {}
+        for nm in in_names:
+            low = nm.lower()
+            if low == "src":
+                feeds[nm] = frame.transpose(2, 0, 1)[None, :, :, :]
+            elif low == "downsample_ratio":
+                feeds[nm] = ratio
+            elif low.startswith("r") and low.endswith("i"):
+                idx = int(low[1]) - 1
+                if 0 <= idx < 4:
+                    feeds[nm] = rec[idx]
+        outs = sess.run(None, feeds)
+        by_name = dict(zip(out_names, outs))
+        pha = np.asarray(by_name.get("pha", outs[min(1, len(outs) - 1)]))[0, 0]
+        fgr = np.asarray(by_name.get("fgr", outs[0]))[0].transpose(1, 2, 0)
+        for i in range(4):
+            if f"r{i+1}o" in by_name:
+                rec[i] = by_name[f"r{i+1}o"]
+        return pha, fgr
+
+    return _video_matte_ai(args, ff, src, W, H, fps, limit, out, alpha_fn, f"rvm:{model}",
+                           {"model": model, "providers": providers,
+                            "downsample_ratio": args.downsample_ratio,
+                            "note": "RVM 是人像/人体视频抠像模型，仅适合画面里有人的素材"})
 
 
 def export_compare_frames(ff: str, before, after, out_dir: Path, stem: str, as_json: bool) -> dict:
@@ -1779,30 +1931,33 @@ def cmd_video_text_anim(args) -> int:
 
 
 # ---------------------------- 光效与调色预设 ----------------------------
+#
+# 重要：blend/screen 类效果必须在 gbrp（或 rgba）空间做——直接对 yuv420p 做
+# all_mode=screen 会把 UV 平面当亮度混，实测造成整片 +60 的品红偏移（真事故）。
+# 因此每个用 blend 的预设都显式 format=gbrp ... format=yuv420p 包夹。
 
-# 每个预设是一段 filter_complex 片段：{inp} 为输入标签，{out} 为输出标签
 FX_PRESETS = {
-    "glow":        "{inp}split=2[ga][gb];[ga]gblur=sigma=20[gg];[gg][gb]blend=all_mode=screen:all_opacity=0.55{out}",
-    "bloom":       "{inp}split=2[ba][bb];[ba]curves=all='0/0 0.55/0.78 1/1',gblur=sigma=28[bg];[bg][bb]blend=all_mode=screen:all_opacity=0.6{out}",
-    "soft-focus":  "{inp}split=2[sa][sb];[sa]gblur=sigma=12[sg];[sg][sb]blend=all_mode=screen:all_opacity=0.25{out}",
-    "leak":        "{inp}[leakin]overlay=0:0:shortest=1{out}",
+    "glow":        "{inp}format=gbrp,split=2[ga][gb];[ga]gblur=sigma=20[gg];[gg][gb]blend=all_mode=screen:all_opacity=0.45,format=yuv420p{out}",
+    "bloom":       "{inp}format=gbrp,split=2[ba][bb];[ba]curves=all='0/0 0.55/0.78 1/1',gblur=sigma=28[bg];[bg][bb]blend=all_mode=screen:all_opacity=0.5,format=yuv420p{out}",
+    "soft-focus":  "{inp}format=gbrp,split=2[sa][sb];[sa]gblur=sigma=12[sg];[sg][sb]blend=all_mode=screen:all_opacity=0.2,format=yuv420p{out}",
+    "leak":        "{inp}format=gbrp[fxin];[fxin][leakin]blend=all_mode=screen:all_opacity={leak_op},format=yuv420p{out}",
     "trail":       "{inp}tmix=frames=6:weights='1 1 2 3 5 8'{out}",
     "grain":       "{inp}noise=alls=9:allf=t{out}",
     "vignette":    "{inp}vignette=PI/5{out}",
     "sharpen":     "{inp}unsharp=5:5:1.0:5:5:0.0{out}",
-    "warm":        "{inp}colorbalance=rs=0.06:gs=0.02:bs=-0.06,eq=saturation=1.06{out}",
-    "cool":        "{inp}colorbalance=rs=-0.06:gs=0.0:bs=0.08,eq=saturation=0.98{out}",
-    "teal-orange": "{inp}colorbalance=rs=0.12:gs=-0.02:bs=-0.10,colorbalance=rh=-0.06:bh=0.10,"
-                   "eq=contrast=1.06:saturation=1.08{out}",
+    "warm":        "{inp}colorbalance=rs=0.05:gs=0.01:bs=-0.05,eq=saturation=1.05{out}",
+    "cool":        "{inp}colorbalance=rs=-0.05:gs=0.0:bs=0.06,eq=saturation=0.98{out}",
+    "teal-orange": "{inp}colorbalance=rs=0.06:gs=0.0:bs=-0.05,colorbalance=rh=-0.03:bh=0.05,"
+                   "eq=contrast=1.05:saturation=1.05{out}",
     "film":        "{inp}curves=all='0/0.02 0.5/0.5 1/0.98',noise=alls=6:allf=t,vignette=PI/4.5{out}",
-    "punch":       "{inp}eq=contrast=1.12:saturation=1.12:brightness=0.02,unsharp=5:5:0.8{out}",
+    "punch":       "{inp}eq=contrast=1.08:saturation=1.08:brightness=0.01,unsharp=5:5:0.8{out}",
 }
 
 FX_NOTES = {
     "glow": "柔光晕：模糊层 screen 叠加",
     "bloom": "高光泛光：先提亮高光再模糊叠加",
     "soft-focus": "轻柔焦：低透明度叠加（人像/产品）",
-    "leak": "光泄漏：叠加程序化渐变光斑（可调 --leak-opacity）",
+    "leak": "光泄漏：左上角暖色光斑径向晕开（只提亮局部，不做全片加色；可调 --leak-opacity）",
     "trail": "运动拖影：6 帧加权混合",
     "grain": "胶片颗粒",
     "vignette": "暗角",
@@ -1848,15 +2003,16 @@ def cmd_video_fx(args) -> int:
 
     stages: list[str] = []
     uses_leak = "leak" in names
+    op = max(0.0, min(1.0, args.leak_opacity))
     if uses_leak:
-        # 光泄漏：用 lavfi gradients 生成慢速流动的暖色光（比逐像素 geq 快两个数量级），
-        # 透明度用 colorchannelmixer 控制，overlay 加 shortest 防止无限源拖死编码。
-        op = max(0.0, min(1.0, args.leak_opacity))
-        stages.append(f"[1:v]format=rgba,colorchannelmixer=aa={op:.2f}[leakin]")
+        # 光泄漏：lavfi gradients 生成缓慢流动的暖色光（只用暖色，绝不放品红——
+        # 上一版用了 0xff3cac 导致全片泛粉，已作为事故记录），
+        # 强度由 screen 混合的 all_opacity 控制，不整体压色。
+        stages.append("[1:v]format=gbrp[leakin]")
     cur = "[0:v]"
     for i, nm in enumerate(names):
         outl = f"[fx{i}]"
-        stages.append(FX_PRESETS[nm].format(inp=cur, out=outl))
+        stages.append(FX_PRESETS[nm].format(inp=cur, out=outl, leak_op=f"{op:.2f}"))
         cur = outl
     if args.lut:
         lut_path = str(Path(args.lut).resolve()).replace("\\", "/").replace(":", r"\:")
@@ -1872,8 +2028,9 @@ def cmd_video_fx(args) -> int:
     if uses_leak:
         dur = limit or float(data.get("format", {}).get("duration", 0) or 5.0)
         cmd += ["-f", "lavfi", "-i",
-                f"gradients=s={W}x{H}:c0=0x2a1200:c1=0xff8a3c:c2=0xff3cac:"
-                f"x0=0:y0=0:x1={W}:y1={H}:d={max(1.0, dur):.3f}:speed=0.012:n=3"]
+                f"gradients=s={W}x{H}:type=radial:c0=0xffb066:c1=0x140b05:c2=0x000000:"
+                f"x0={int(W*0.18)}:y0={int(H*0.12)}:x1={int(W*0.9)}:y1={int(H*0.95)}:"
+                f"d={max(1.0, dur):.3f}:speed=0.01:n=3"]
     cmd += ["-filter_complex", ";".join(stages), "-map", "[vout]", "-map", "0:a?"]
     if limit:
         cmd += ["-t", f"{limit:.3f}"]
@@ -2089,12 +2246,20 @@ def cmd_selftest(args) -> int:
           f"{p.get('width')}x{p.get('height')} {err}")
 
     # ---------- T3 视频特效（抠像换背景 / 动效文字 / 转场 / 光效）----------
+    # 闸门判定逻辑先做纯函数自检（0.2.0 事故：主体被抠没却照样输出成片）
+    v_empty, _ = matte_verdict({"frames": 30, "coverage_mean": 0.0, "coverage_max": 0.0}, 0.005)
+    v_ok, _ = matte_verdict({"frames": 30, "coverage_mean": 0.31, "coverage_max": 0.52}, 0.005)
+    v_full, _ = matte_verdict({"frames": 30, "coverage_mean": 0.99, "coverage_max": 1.0}, 0.005)
+    check("T3 主体闸门判定逻辑", v_empty == "subject_not_found" and v_ok == "ok"
+          and v_full == "background_not_removed", f"{v_empty}/{v_ok}/{v_full}")
+
     vfx_in = clip1
     if ff and vfx_in.exists():
         m1 = work / "fx-matte.mp4"
-        code, _, err = call(["video-matte", str(vfx_in), "--limit", "1", "--bg-color", "white",
-                             "--out", str(m1)])
+        code, out, err = call(["video-matte", str(vfx_in), "--limit", "1", "--bg-color", "white",
+                               "--out", str(m1)])
         white_ok = False
+        subject_cov = 0.0
         if m1.exists() and code == 0:
             try:
                 import numpy as np
@@ -2109,8 +2274,14 @@ def cmd_selftest(args) -> int:
                     white_ok = bool(corners.min() > 225)
             except Exception:
                 white_ok = False
-        check("T3 video-matte (AI 抠像→白底)", code == 0 and white_ok,
-              "四角像素已被替换为白底" if white_ok else err[:200])
+        try:
+            subject_cov = float(json.loads(out).get("subject", {}).get("coverage_mean") or 0.0)
+        except Exception:
+            subject_cov = 0.0
+        # 光看「四角变白」是不够的：全白空片也满足这个条件（0.2.0 就是这样漏出去的）。
+        # 必须同时验证主体还在画面里。
+        check("T3 video-matte (AI 抠像→白底 + 主体仍在)", code == 0 and white_ok and subject_cov >= 0.02,
+              f"主体覆盖率={subject_cov:.3f}，{'四角已变白' if white_ok else '四角未变白'} {err[:120]}")
 
         mc = work / "fx-chromakey.mp4"
         code, _, err = call(["video-matte", str(vfx_in), "--backend", "chromakey", "--key-color",
@@ -2147,6 +2318,38 @@ def cmd_selftest(args) -> int:
         fxl = work / "fx-leak.mp4"
         code, _, err = call(["video-fx", str(vfx_in), "--preset", "leak", "--limit", "1", "--out", str(fxl)])
         check("T3 video-fx (光泄漏)", code == 0 and fxl.exists(), err[:200])
+
+        # 全局偏色闸门：0.2.0 事故是 light-leak 把整片染粉（R-(G+B)/2 由 +13 变 +56…+67）。
+        # 衡量「相对源片的偏色增量」，超过阈值即失败——这条比「文件存在」有意义得多。
+        def _cast_of(video, t: float):
+            if not video or not Path(video).exists():
+                return None
+            f = work / f"cast-{Path(video).stem}.jpg"
+            run_ff([ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t:.2f}", "-i", str(video),
+                    "-frames:v", "1", "-q:v", "2", str(f)])
+            if not f.exists():
+                return None
+            try:
+                import numpy as np
+                arr = np.asarray(Image.open(f).convert("RGB"), dtype=np.float32)
+                h, w, _ = arr.shape
+                core = arr[int(h * 0.18):int(h * 0.82), int(w * 0.12):int(w * 0.88)].reshape(-1, 3).mean(axis=0)
+                return float(core[0] - (core[1] + core[2]) / 2)
+            except Exception:
+                return None
+
+        base_cast = _cast_of(vfx_in, 0.5)
+        worst = None
+        for nm, vv in (("look", fxo), ("leak", fxl), ("glitch", jout)):
+            c = _cast_of(vv, 0.5)
+            if c is None or base_cast is None:
+                continue
+            d = c - base_cast
+            if worst is None or abs(d) > abs(worst[1]):
+                worst = (nm, d)
+        check("T3 全局偏色闸门 (光效不许全片染色)", worst is not None and abs(worst[1]) <= 20,
+              (f"源片 R-均值差={base_cast:+.1f}，最大增量 {worst[0]} Δ={worst[1]:+.1f}"
+               if worst else "取不到帧"))
 
     # ---------- 汇总 ----------
     passed = sum(1 for r in results if r["ok"])
@@ -2373,10 +2576,19 @@ def build_parser() -> argparse.ArgumentParser:
     ve.add_argument("--out-dir")
     ve.set_defaults(func=cmd_video_export)
 
-    vm = sub.add_parser("video-matte", help="视频抠像换背景：AI（RVM，任意背景）或色键（绿幕）")
+    vm = sub.add_parser("video-matte", help="视频抠像换背景：AI 逐帧（rembg 通用 / RVM 人像）或色键（绿幕）")
     vm.add_argument("input")
-    vm.add_argument("--backend", default="auto", choices=["auto", "rvm", "chromakey"])
-    vm.add_argument("--model", default="mobilenetv3", choices=sorted(RVM_MODELS))
+    vm.add_argument("--backend", default="auto", choices=["auto", "rembg", "rvm", "chromakey"],
+                    help="auto=rembg 通用逐帧抠像（产品/物体/人都行）；rvm=人像专用；chromakey=绿幕")
+    vm.add_argument("--model", default="auto",
+                    help="rembg 模型名（u2net/isnet-general-use/birefnet-general…）或 RVM 名（mobilenetv3/resnet50）")
+    vm.add_argument("--quality", default="auto", choices=["fast", "auto", "best"],
+                    help="fast=u2net 最快 / auto=isnet-general-use（视频默认，约 0.4 秒/帧）/ best=birefnet（约 6 秒/帧）")
+    vm.add_argument("--min-subject", type=float, default=0.005,
+                    help="主体存在性闸门：前景覆盖率低于该值判定为「主体被抠没」并拒绝交付（默认 0.5%%）")
+    vm.add_argument("--allow-empty", action="store_true", help="明知无主体仍要输出（关闭闸门，风险自负）")
+    vm.add_argument("--mask-scale", type=float, default=1.0, help="rembg 推理缩放（0.5 更快、边缘更柔）")
+    vm.add_argument("--post-process-mask", action="store_true", help="rembg 遮罩后处理（去小噪点、平滑边缘）")
     vm.add_argument("--mode", default="composite", choices=["composite", "alpha", "mask"],
                     help="composite=换背景出成片 / alpha=输出带透明通道的 webm / mask=输出黑白遮罩")
     vm.add_argument("--bg-color", help="背景底色，如 white / #1F6E43")

@@ -26,7 +26,7 @@ node "$pkg\scripts\run-toolkit.mjs" doctor --json     # confirm the video tier a
 ```
 
 ffmpeg ships inside the runtime (`imageio-ffmpeg`) — never install system ffmpeg or describe an edit you did not perform.
-**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` (26 checks, includes matting, animated text, transitions, light effects, subtitles and exports). Non-zero exit = broken capability here: report it.
+**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` (29 checks, includes matting + subject-presence gate, animated text, transitions, light effects, colour-cast gate, subtitles and exports). Non-zero exit = broken capability here: report it.
 
 ## Effects you can produce here (no CapCut / Premiere required)
 
@@ -34,14 +34,21 @@ Four capability groups, all driven by the same CLI — see `reference/commands.m
 
 | Need | Command | Notes |
 |---|---|---|
-| **抠像换背景** — cut a subject out of any background and drop it on white, a colour, an image or another clip | `video-matte` | AI path = RVM ONNX (auto-downloads 14 MB; ~81 fps at 568×320 on CPU, ~17 fps at 720×1280). Green-screen footage: `--backend chromakey` needs no model. `--mode alpha` writes a transparent WebM, `--mode mask` a black-and-white matte. |
+| **抠像换背景** — cut a subject out of any background and drop it on white, a colour, an image or another clip | `video-matte` | **Default backend is `rembg` per-frame general matting** (`isnet-general-use`, ~0.4 s/frame at 720×1280): works for products, objects, animals and people. `--backend rvm` is a **portrait/human** model — it returns an empty matte for product footage, so only use it when the shot really contains a person. Green-screen footage: `--backend chromakey` needs no model. `--mode alpha` writes a transparent WebM, `--mode mask` a black-and-white matte. **Every AI run passes a subject-presence gate**: if mean foreground coverage < `--min-subject` (default 0.5 %) it aborts, deletes the output and exits non-zero instead of shipping an empty video. |
 | **文字动效** — headline animations | `video-text-anim` | Presets: `fade`, `slide-up/down/left/right`, `typewriter`, `pop`, `bounce`, `karaoke` (word highlight), `lower-third`. Generates an ASS file (keep it, edit it, re-burn) or burns straight in. |
 | **转场** — 53 native `xfade` transitions plus stylized ones | `video-join --transition …` | `--list-transitions` prints the catalogue. Stylized presets: `glitch` (RGB-split + noise + pixelize), `whip-pan` (motion smear + smooth slide), `flash` (fade-to-white), `soft-zoom` (blur-in), `film-burn` (warm shift + grain + fade-to-black). |
-| **光效 / 调色** — glow, bloom, light leaks, trails, looks | `video-fx --preset …` | `glow`, `bloom`, `soft-focus`, `leak`, `trail`, `grain`, `vignette`, `sharpen`, `warm`, `cool`, `teal-orange`, `film`, `punch`; chain them (`--preset teal-orange,glow,film`) and add a real LUT with `--lut look.cube`. |
+| **光效 / 调色** — glow, bloom, light leaks, trails, looks | `video-fx --preset …` | `glow`, `bloom`, `soft-focus`, `leak`, `trail`, `grain`, `vignette`, `sharpen`, `warm`, `cool`, `teal-orange`, `film`, `punch`; chain them (`--preset teal-orange,glow,film`) and add a real LUT with `--lut look.cube`. `leak` is a **localised warm radial glow in the upper-left corner** (`--leak-opacity`, default 0.35) — it brightens one area instead of tinting the whole frame. |
 
 **Honest ceiling.** ffmpeg + these models give you matting, animated text, transitions and light effects at deliverable quality. They do **not** give you motion tracking (pinning text to a moving object), 3D camera moves, particle systems, or complex rotoscoping — those need After Effects. Say so instead of approximating silently.
 
 **Always hand over comparison frames.** You cannot see the picture on most routes, so for any effect run `--compare` (before/after frames + a contact sheet) and let the user judge; never assert that an effect "looks good".
+
+**Two failures that look like deliverables, so they are gated.** (a) A matte that removed the *subject* instead of the background still produces a valid MP4 — a white or transparent frame with nothing in it. (b) A light effect that tints the whole frame still produces a valid MP4 with the wrong colour. Both shipped once (0.2.0) because only container/duration were checked. Every AI matte now reports `subject.coverage_mean` and refuses to deliver below threshold; before handing over any graded clip, run the objective gate and report the number:
+
+```powershell
+# 抠像：主体还在吗？  光效：有没有全片染色？（Δ 为「相对未调色文件」的偏色增量，阈值 20）
+python "$pkg\tests\verify_fix.py" --matte deliver\a-white.mp4 --matte-ref raw\a.mp4 --fx deliver\b-final.mp4 --fx-ref work\b-titled.mp4
+```
 
 ## Three stages — never skip stage 1
 
@@ -74,10 +81,11 @@ Platform canvases, safe zones, pacing and delivery specs: **`reference/platform-
 ## Verification checklist (before claiming delivery)
 
 1. `video-probe` each delivered file: expected duration (±0.2 s), canvas, `yuv420p`, audio present when intended.
-2. Extract frames from the **output** (`video-sheet --interval 2`) and inspect them, or hand them to the user — never assert visual quality you did not verify.
-3. First frame as cover: `video-cover --scan 8` and confirm it shows the product, not a blur.
-4. Subtitles in sync (±0.3 s) and inside the safe zones; nothing clipped at the edges.
-5. Music must not mask narration: start around `--music-volume 0.3` against `--original-volume 1.0`.
+2. **Objective gates first:** matte output ≥2 % non-white subject pixels; graded output |Δ cast| ≤ 20 against the ungraded file. Report the measured numbers, not adjectives. Rebuild rather than explain a failure away.
+3. Extract frames from the **output** (`video-sheet --interval 2`) and inspect them, or hand them to the user — never assert visual quality you did not verify.
+4. First frame as cover: `video-cover --scan 8` and confirm it shows the product, not a blur.
+5. Subtitles in sync (±0.3 s) and inside the safe zones; nothing clipped at the edges; animated titles each get enough screen time to be read (≥1.2 s at the end of a short cut).
+6. Music must not mask narration: start around `--music-volume 0.3` against `--original-volume 1.0`.
 
 ## Red lines
 

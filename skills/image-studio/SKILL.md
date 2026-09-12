@@ -28,7 +28,7 @@ node "$pkg\scripts\run-toolkit.mjs" doctor --json     # tiers, ffmpeg, fonts, mo
 
 Call the toolkit as `node "$pkg\scripts\run-toolkit.mjs" <command> …` (or directly `"$pkg\runtime\Scripts\python.exe" "$pkg\toolkit\cs.py" …`). Always pass `--json`.
 
-**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` — 26 checks on self-generated fixtures. Non-zero exit means a capability is broken here: report it, do not deliver.
+**First use on any machine:** `node "$pkg\scripts\run-toolkit.mjs" selftest` — 29 checks on self-generated fixtures (the 3 video-effect gates run too, so a pass means the whole pack is healthy). Non-zero exit means a capability is broken here: report it, do not deliver.
 
 **Tiers.** T0 Pillow (text, logo, compose, export, sheet, palette, inspect) · T1 rembg+ONNX (matting, inpaint) · T2 ffmpeg (video cut/join/subtitles/export) · T3 onnxruntime (video matting, animated titles, transitions, light effects — see the `video-studio` skill). If `doctor` reports a missing tier, say so instead of faking the result.
 

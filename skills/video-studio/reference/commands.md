@@ -10,7 +10,7 @@
 | `video-sheet <files…>` | 按间隔抽帧（通览/复核） | `--interval 2`、`--width 480`、`--out-dir` |
 | `video-cut <file>` | 裁切 | `--start 5` / `1:30`、`--end`、`--duration`、`--accurate`（帧精确，重编码）、`--out`、`--out-dir` |
 | `video-join <files…>` | 拼接 | `--transition none\|<任意 xfade 名>\|glitch\|whip-pan\|flash\|soft-zoom\|film-burn`、`--list-transitions`、`--transition-duration 0.5`、`--fps 30`、`--reencode` |
-| `video-matte <file>` | **抠像换背景**（AI RVM / 绿幕色键） | `--mode composite\|alpha\|mask`、`--bg-color`、`--bg-image`、`--backend chromakey --key-color 0x00FF00 --key-similarity 0.3`、`--model mobilenetv3\|resnet50`、`--downsample-ratio 0.375`、`--alpha-smooth 0.25`、`--limit`、`--gpu`、`--compare` |
+| `video-matte <file>` | **抠像换背景**（AI 逐帧：rembg 通用 / RVM 人像 / 绿幕色键） | `--backend auto\|rembg\|rvm\|chromakey`、`--quality fast\|auto\|best`、`--mode composite\|alpha\|mask`、`--bg-color`、`--bg-image`、`--min-subject 0.005`、`--allow-empty`、`--mask-scale`、`--post-process-mask`、`--backend chromakey --key-color 0x00FF00 --key-similarity 0.3`、`--model`、`--downsample-ratio 0.375`（RVM）、`--alpha-smooth 0.25`、`--limit`、`--gpu`、`--compare` |
 | `video-text-anim [file]` | **动效文字**（ASS 生成 / 烧入） | `--text`、`--spec blocks.json`、`--preset fade\|slide-up\|slide-down\|slide-left\|slide-right\|typewriter\|pop\|bounce\|karaoke\|lower-third`、`--position`、`--size-ratio 0.055`、`--outline`、`--shadow`、`--box '#00000099'`、`--highlight`、`--ass-out`、`--ass-only` |
 | `video-fx <file>` | **光效 / 调色** | `--list`、`--preset glow,bloom,soft-focus,leak,trail,grain,vignette,sharpen,warm,cool,teal-orange,film,punch`、`--lut x.cube`、`--leak-opacity 0.35`、`--compare` |
 | `video-text <file>` | 屏幕文案（PIL 渲染透明层 → overlay，中文可靠） | `--text "行1\n行2"`、`--position tc…br`、`--size`、`--color`、`--stroke`、`--stroke-width`、`--box`、`--start`、`--end`、`--png-out` |
@@ -56,14 +56,17 @@
 
 | 项 | 说明 |
 |---|---|
-| AI 模型 | RVM（Robust Video Matting）ONNX，首次自动下载到 `~/.dsh-creative-studio/models`（mobilenetv3 14 MB / resnet50 102 MB）。可用 `CS_MODEL_DIR` 改缓存目录 |
-| 实测速度 | CPU：568×320 ≈ **81 fps**；720×1280 ≈ **17 fps**。装 `onnxruntime-gpu` 后加 `--gpu` 更快 |
-| 时间一致性 | RVM 自带循环状态（r1i–r4i），外加 `--alpha-smooth 0.25` 时域平滑，抑制边缘闪烁 |
+| 默认后端（0.2.1 起） | `rembg` **逐帧通用抠像**：`--quality fast=u2net / auto=isnet-general-use / best=birefnet-general`，产品、物体、动物、人都能抠 |
+| 实测速度 | CPU + 720×1280：isnet ≈ **2.3 fps**（3 秒片约 40 秒）；birefnet 约 6 秒/帧，长片先 `--limit 3` 试跑 |
+| 人像后端 | `--backend rvm`（RVM ONNX，首次自动下载到 `~/.dsh-creative-studio/models`，mobilenetv3 14 MB / resnet50 102 MB）。**只适合画面里有人的素材**：拿它抠产品会得到全空遮罩 |
+| 时间一致性 | 逐帧推理本身会闪，所以默认 `--alpha-smooth 0.25` 做 alpha 时域平滑；RVM 另带循环状态（r1i–r4i） |
 | 三种输出 | `composite`（换背景出成片，保留原音轨）/ `alpha`（透明通道 WebM，VP9+yuva420p）/ `mask`（黑白遮罩，灰阶 mp4） |
 | 背景 | `--bg-color white\|#1F6E43`、`--bg-image 背景图.jpg`（自动缩放） |
-| 绿幕素材 | `--backend chromakey --key-color 0x00FF00 --despill green`，不加载模型，秒级 |
-| 判据 | `--compare` 会导出前后帧 + 接触表；单帧客观判据：换白底后画面四角像素应 > 225 |
-| 已知限制 | 玻璃、纱料、快速甩动仍会有边缘瑕疵；`mobilenetv3` 比 `resnet50` 更容易糊边，成片标准高时用 `--model resnet50` |
+| 绿幕素材 | `--backend chromakey --key-color 0x00FF00 --despill green`，不加载模型，秒级（走色键时不受主体闸门约束） |
+| **主体存在性闸门** | 每帧统计前景覆盖率（alpha>0.5 的像素占比）。均值低于 `--min-subject`（默认 0.005）→ 第 20 帧提前熔断、删除产物、`status: rejected`、退出码 2，**不会交付空视频**。`--allow-empty` 才强行输出（会打印警告并标记 `gate_overridden`） |
+| 质量辅助参数 | `--mask-scale 0.5`（更快更柔）、`--post-process-mask`（去小噪点） |
+| 判据 | JSON 里的 `subject.coverage_mean/min/max` + `gate.verdict`；`--compare` 导出前后帧 + 接触表；模型看不到画面，交付前用 `tests/verify_fix.py --matte` 量「非白像素占比」并由人眼确认 |
+| 已知限制 | 玻璃、纱料、快速甩动、主体与背景同色仍会有边缘瑕疵；逐帧抠像在细发丝/半透明处的时域稳定性弱于专业工具 |
 
 ## 动效文字（video-text-anim）
 
@@ -89,7 +92,9 @@
 ## 光效与调色（video-fx）
 
 - 预设可串联：`--preset teal-orange,glow,film`（按顺序应用）。
-- `leak` 用 lavfi `gradients` 生成慢速流动光斑（不要用 `geq` 逐像素表达式——CPU 上会慢到超时），透明度用 `--leak-opacity`。
+- `leak` 用 lavfi `gradients` 生成**左上角径向暖光斑**（`type=radial` + 外圈近黑，只提亮局部）。不要用 `geq` 逐像素表达式（CPU 上会慢到超时），也不要用全画面线性渐变——0.2.0 事故就是它把整片染粉，并产生一个缓慢漂移的亮斑（用户看出像"幽灵人头"）。强度用 `--leak-opacity`（默认 0.35）。
+- **screen/blend 类叠加必须显式 `format=gbrp` 再回 `format=yuv420p`**：在 yuv420p 上混 UV 平面会产生品红偏色。所有内置预设已按此写死。
 - 外部 LUT：`--lut look.cube`（`.cube`/`.3dl`），会追加在预设链末尾。
+- **偏色闸门**：任何调色/光效交付前用 `python tests/verify_fix.py --fx <成片> --fx-ref <未调色文件>` 量 `R-(G+B)/2` 的相对增量，|Δ| ≤ 20 才算通过（`selftest` 里也带这条）。
 - 与抠像组合的典型流程：`video-matte`（换背景）→ `video-fx --preset teal-orange,glow`（统一影调）→ `video-text-anim`（标题）→ `video-export`。
 
